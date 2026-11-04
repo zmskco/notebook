@@ -88,6 +88,9 @@ impl ColumnWidth {
 /// 分屏中线的拖拽载荷
 struct SplitDrag;
 
+/// 源代码管理里「改动 / 历史」分隔条的拖拽载荷
+struct HistoryDrag;
+
 /// 拖拽时跟随鼠标的占位元素（本体不可见，只为借用 GPUI 的拖拽管线）
 struct SplitGhost;
 
@@ -100,6 +103,10 @@ impl Render for SplitGhost {
 /// 分屏比例的下限和上限，避免任一侧被拖没
 const MIN_SPLIT: f32 = 0.15;
 const MAX_SPLIT: f32 = 0.85;
+
+/// 历史提交面板的高度范围
+const MIN_HISTORY: f32 = 72.;
+const DEFAULT_HISTORY: f32 = 220.;
 
 impl FontChoice {
     const ALL: [Self; 4] = [Self::Hei, Self::Song, Self::WenKai, Self::PuHuiTi];
@@ -298,6 +305,8 @@ pub struct NotesApp {
     column_width: ColumnWidth,
     /// 分屏时左栏（源码）所占比例
     split_ratio: f32,
+    /// 源代码管理里历史提交面板的高度
+    history_height: f32,
     /// 切换工作区后待打开的文档：创建编辑器需要 Window，留到渲染时打开
     pending_open: Option<PathBuf>,
     wenkai_family: SharedString,
@@ -348,6 +357,7 @@ impl NotesApp {
             theme_choice: ThemeChoice::Elegant,
             column_width: ColumnWidth::Standard,
             split_ratio: 0.5,
+            history_height: DEFAULT_HISTORY,
             pending_open: None,
             wenkai_family,
             puhuiti_family,
@@ -2108,6 +2118,23 @@ impl NotesApp {
         v_flex()
             .flex_1()
             .min_h_0()
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<HistoryDrag>, _, cx| {
+                    let panel_height = f32::from(event.bounds.size.height);
+                    if panel_height <= 0. {
+                        return;
+                    }
+                    let bottom = f32::from(event.bounds.origin.y) + panel_height;
+                    let pointer = f32::from(event.event.position.y);
+                    // 给上方的改动列表留出空间，避免把历史拖到没有位置
+                    let max = (panel_height - 160.).max(MIN_HISTORY);
+                    let height = (bottom - pointer).clamp(MIN_HISTORY, max);
+                    if (this.history_height - height).abs() > 0.5 {
+                        this.history_height = height;
+                        cx.notify();
+                    }
+                },
+            ))
             .child(branch_row)
             .children(branches_popup)
             .child(commit_box)
@@ -2121,11 +2148,20 @@ impl NotesApp {
             )
             .child(
                 div()
+                    .id("git-history-divider")
+                    .h(px(5.))
+                    .w_full()
+                    .flex_shrink_0()
+                    .bg(border)
+                    .cursor(CursorStyle::ResizeUpDown)
+                    .on_drag(HistoryDrag, |_, _, _, cx| cx.new(|_| SplitGhost)),
+            )
+            .child(
+                div()
                     .id("git-history")
-                    .max_h(px(220.))
+                    .h(px(self.history_height))
+                    .flex_shrink_0()
                     .overflow_y_scroll()
-                    .border_t_1()
-                    .border_color(border)
                     .children(history_rows),
             )
             .into_any_element()
