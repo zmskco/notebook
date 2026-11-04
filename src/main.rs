@@ -17,6 +17,9 @@
 //   Delete           删除目录树中选中的文件（焦点在目录树上时）
 //   F5               刷新目录树与 Git 状态
 
+// 发布构建不附带控制台窗口；调试构建保留控制台方便看日志
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod fs_ops;
 mod git;
