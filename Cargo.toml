@@ -1,0 +1,14 @@
+[package]
+name = "notebook"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui-kit = "0.8.1"
+gpui-kit-markdown-editor = { version = "0.1.2", default-features = false }
+
+[build-dependencies]
+embed-resource = "3.0.12"
+
+[profile.dev]
+opt-level = 1
