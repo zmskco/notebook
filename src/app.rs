@@ -1,4 +1,4 @@
-//! 主界面：侧栏（资源管理器 / 源代码管理）+ 多标签编辑区 + 状态栏
+//! 主界面：侧栏（资源管理器 / 搜索 / 源代码管理）+ 多标签编辑区 + 状态栏
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -8,7 +8,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dialog::{DialogAction, DialogFooter};
 use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
-use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState, Position};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::text::TextView;
@@ -24,7 +24,11 @@ use markdown_editor::{BlockEditor, BlockEditorEvent, BlockEditorState};
 use crate::file_icons::FileIcons;
 use crate::fs_ops;
 use crate::git;
-use crate::{CloseTab, DeleteSelected, NextTab, PrevTab, Refresh, RenameSelected, Save, TogglePreview};
+use crate::search;
+use crate::{
+    CloseTab, DeleteSelected, FocusSearch, NextTab, PrevTab, Refresh, RenameSelected, Save,
+    TogglePreview,
+};
 
 #[derive(Clone)]
 enum PromptOp {
@@ -43,6 +47,7 @@ enum ViewMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SidebarView {
     Explorer,
+    Search,
     SourceControl,
 }
 
@@ -302,6 +307,21 @@ struct GitPanel {
     loading: bool,
 }
 
+/// 全局搜索面板
+struct SearchPanel {
+    input: Entity<InputState>,
+    replace: Entity<InputState>,
+    /// 最近一次发起搜索的关键词
+    query: String,
+    case_sensitive: bool,
+    results: Vec<search::FileHits>,
+    total: usize,
+    truncated: bool,
+    searching: bool,
+    /// 每次发起搜索自增，后台结果返回时用来丢弃过期的那次
+    generation: u64,
+}
+
 pub struct NotesApp {
     root: PathBuf,
     tree_state: Entity<TreeState>,
@@ -313,6 +333,7 @@ pub struct NotesApp {
     sidebar: SidebarView,
     show_branches: bool,
     git: GitPanel,
+    search: SearchPanel,
     font: FontChoice,
     font_size: f32,
     theme_choice: ThemeChoice,
@@ -350,6 +371,8 @@ impl NotesApp {
         cx.observe(&tree_state, |_, _, cx| cx.notify()).detach();
 
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("提交说明"));
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索"));
+        let replace_input = cx.new(|cx| InputState::new(window, cx).placeholder("替换为"));
 
         let mut this = Self {
             root,
@@ -370,6 +393,17 @@ impl NotesApp {
                 input,
                 loading: false,
             },
+            search: SearchPanel {
+                input: search_input.clone(),
+                replace: replace_input,
+                query: String::new(),
+                case_sensitive: false,
+                results: Vec::new(),
+                total: 0,
+                truncated: false,
+                searching: false,
+                generation: 0,
+            },
             font: FontChoice::Hei,
             font_size: 18.,
             theme_choice: ThemeChoice::Elegant,
@@ -383,6 +417,14 @@ impl NotesApp {
         };
         this.apply_theme(ThemeChoice::Elegant, cx);
         this.refresh_git(cx);
+
+        // 边打字边搜索
+        cx.subscribe(&search_input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.start_search(cx);
+            }
+        })
+        .detach();
 
         // 恢复上次打开的文档，已经删除的文件直接跳过
         let mut restored = 0;
@@ -1129,7 +1171,225 @@ impl NotesApp {
     fn on_refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
         self.rescan(cx);
         self.refresh_git(cx);
+        self.start_search(cx);
         self.set_status("已刷新", cx);
+    }
+
+    // ---------- 全局搜索 ----------
+
+    fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_search(window, cx);
+    }
+
+    /// 切到搜索面板，并把光标放进搜索框
+    fn show_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar = SidebarView::Search;
+        self.search
+            .input
+            .update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    /// 按输入框里的关键词搜索整个工作区
+    fn start_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.search.input.read(cx).value().to_string();
+        self.search.query = query.clone();
+        self.search.generation += 1;
+        let generation = self.search.generation;
+
+        if query.trim().is_empty() {
+            self.search.results.clear();
+            self.search.total = 0;
+            self.search.truncated = false;
+            self.search.searching = false;
+            cx.notify();
+            return;
+        }
+
+        let root = self.root.clone();
+        let case_sensitive = self.search.case_sensitive;
+        self.search.searching = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { search::search(&root, &query, case_sensitive) })
+                .await;
+
+            this.update(cx, |this, cx| {
+                // 打字快时会有多次搜索同时在跑，只认最后一次的结果
+                if this.search.generation != generation {
+                    return;
+                }
+                this.search.results = outcome.files;
+                this.search.total = outcome.total;
+                this.search.truncated = outcome.truncated;
+                this.search.searching = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 打开命中的文件并定位到那一行，源码视图才看得见位置
+    fn jump_to_hit(
+        &mut self,
+        path: PathBuf,
+        line: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_file(path.clone(), window, cx);
+        self.switch_view(ViewMode::Split, window, cx);
+
+        let Some(ix) = self.active else {
+            return;
+        };
+        let Some(Tab::File(doc)) = self.tabs.get_mut(ix) else {
+            return;
+        };
+        if doc.path != path {
+            return;
+        }
+        let position = Position::new(line.saturating_sub(1) as u32, 0);
+        doc.editor
+            .update(cx, |state, cx| state.set_cursor_position(position, window, cx));
+    }
+
+    /// 替换确认框：先数一下会改多少处，再问一次
+    fn confirm_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search.input.read(cx).value().to_string();
+        if query.trim().is_empty() {
+            self.set_status("先输入要查找的内容", cx);
+            return;
+        }
+        let replacement = self.search.replace.read(cx).value().to_string();
+        let mut paths = Vec::new();
+        search::collect_files(&self.root, &mut paths);
+        let case_sensitive = self.search.case_sensitive;
+        let mut total = 0;
+        let mut files = 0;
+        for path in paths {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let (_, count) = search::replace(&text, &query, &replacement, case_sensitive);
+            if count > 0 {
+                total += count;
+                files += 1;
+            }
+        }
+        if total == 0 {
+            self.set_status("没有找到可替换的内容", cx);
+            return;
+        }
+
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            let query = query.clone();
+            let replacement = replacement.clone();
+            dialog
+                .title("全部替换")
+                .child(SharedString::from(format!(
+                    "在工作区 {files} 个文件里替换 {total} 处“{query}”为“{replacement}”？"
+                )))
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("cancel")
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(DialogAction::new().child(Button::new("ok").label("替换"))),
+                )
+                .on_ok(move |_, window, cx| {
+                    let view = view.clone();
+                    let query = query.clone();
+                    let replacement = replacement.clone();
+                    view.update(cx, |this, cx| {
+                        this.do_replace_all(&query, &replacement, window, cx)
+                    });
+                    true
+                })
+        });
+    }
+
+    fn do_replace_all(
+        &mut self,
+        query: &str,
+        replacement: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let case_sensitive = self.search.case_sensitive;
+        let mut paths = Vec::new();
+        search::collect_files(&self.root, &mut paths);
+
+        let mut total = 0;
+        let mut changed = 0;
+        let mut failed = 0;
+
+        for path in paths {
+            // 已经打开的标签改内存里的文本并直接保存，免得磁盘与编辑器各写一份
+            if let Some(ix) = self
+                .tabs
+                .iter()
+                .position(|tab| tab.path() == Some(path.as_path()))
+            {
+                let Some(Tab::File(doc)) = self.tabs.get(ix) else {
+                    continue;
+                };
+                let text = doc.text(cx);
+                let (new_text, count) = search::replace(&text, query, replacement, case_sensitive);
+                if count == 0 {
+                    continue;
+                }
+                let Some(Tab::File(doc)) = self.tabs.get_mut(ix) else {
+                    continue;
+                };
+                doc.editor
+                    .update(cx, |state, cx| state.set_value(new_text.clone(), window, cx));
+                doc.wysiwyg
+                    .update(cx, |state, cx| state.set_source(&new_text, cx).ok());
+                if self.save_doc(ix, cx) {
+                    total += count;
+                    changed += 1;
+                } else {
+                    failed += 1;
+                }
+                continue;
+            }
+
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let (new_text, count) = search::replace(&text, query, replacement, case_sensitive);
+            if count == 0 {
+                continue;
+            }
+            match std::fs::write(&path, new_text) {
+                Ok(_) => {
+                    total += count;
+                    changed += 1;
+                }
+                Err(_) => failed += 1,
+            }
+        }
+
+        let message = if total == 0 {
+            "没有找到可替换的内容".to_string()
+        } else if failed > 0 {
+            format!("已在 {changed} 个文件替换 {total} 处，{failed} 个文件写入失败")
+        } else {
+            format!("已在 {changed} 个文件替换 {total} 处")
+        };
+        self.set_status(message, cx);
+        self.rescan(cx);
+        self.refresh_git(cx);
+        self.start_search(cx);
     }
 
     // ---------- Git ----------
@@ -1160,6 +1420,13 @@ impl NotesApp {
         }
         self.root = root;
         self.expanded.clear();
+
+        // 旧工作区的搜索结果不再适用
+        self.search.results.clear();
+        self.search.total = 0;
+        self.search.searching = false;
+        self.search.truncated = false;
+        self.search.generation += 1;
 
         // 新工作区为空时生成欢迎文档，等下一次渲染再打开
         if fs_ops::is_empty_dir(&self.root) {
@@ -1407,10 +1674,10 @@ impl NotesApp {
         let explorer = self.sidebar == SidebarView::Explorer;
         let view = cx.entity();
 
-        let body = if explorer {
-            self.render_explorer(cx)
-        } else {
-            self.render_git_panel(cx)
+        let body = match self.sidebar {
+            SidebarView::Explorer => self.render_explorer(cx),
+            SidebarView::Search => self.render_search(cx),
+            SidebarView::SourceControl => self.render_git_panel(cx),
         };
 
         v_flex()
@@ -1445,10 +1712,24 @@ impl NotesApp {
                             }),
                     )
                     .child(
+                        Button::new("view-search")
+                            .ghost()
+                            .small()
+                            .selected(self.sidebar == SidebarView::Search)
+                            .icon(IconName::Search)
+                            .tooltip("搜索（Ctrl+Shift+F）")
+                            .on_click({
+                                let view = view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |this, cx| this.show_search(window, cx));
+                                }
+                            }),
+                    )
+                    .child(
                         Button::new("view-git")
                             .ghost()
                             .small()
-                            .selected(!explorer)
+                            .selected(self.sidebar == SidebarView::SourceControl)
                             .icon(IconName::GitBranch)
                             .tooltip("源代码管理")
                             .on_click({
@@ -1860,6 +2141,225 @@ impl NotesApp {
                     })
                     .child(tree_element),
             )
+            .into_any_element()
+    }
+
+    // ---------- 渲染：搜索 ----------
+
+    fn render_search(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let selection = cx.theme().selection;
+        let view = cx.entity();
+
+        let input = self.search.input.clone();
+        let replace_input = self.search.replace.clone();
+        let case_sensitive = self.search.case_sensitive;
+        let query = self.search.query.clone();
+        let searching = self.search.searching;
+
+        let form = v_flex()
+            .p_2()
+            .gap_1()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&input).cleanable(true)),
+                    )
+                    .child(
+                        Button::new("search-case")
+                            .ghost()
+                            .small()
+                            .selected(case_sensitive)
+                            .icon(IconName::CaseSensitive)
+                            .tooltip("区分大小写")
+                            .on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.search.case_sensitive = !this.search.case_sensitive;
+                                        this.start_search(cx);
+                                    })
+                                }
+                            }),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(div().flex_1().min_w_0().child(Input::new(&replace_input)))
+                    .child(
+                        Button::new("search-replace-all")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Replace)
+                            .tooltip("全部替换")
+                            .on_click({
+                                let view = view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |this, cx| this.confirm_replace(window, cx))
+                                }
+                            }),
+                    ),
+            );
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+
+        if query.trim().is_empty() {
+            rows.push(
+                div()
+                    .px_3()
+                    .py_4()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("输入关键词，在当前工作区里查找")
+                    .into_any_element(),
+            );
+        } else if self.search.results.is_empty() {
+            rows.push(
+                div()
+                    .px_3()
+                    .py_4()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(if searching { "搜索中…" } else { "没有匹配的内容" })
+                    .into_any_element(),
+            );
+        }
+
+        for (file_ix, file) in self.search.results.iter().enumerate() {
+            let rel = file
+                .path
+                .strip_prefix(&self.root)
+                .unwrap_or(&file.path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            rows.push(
+                h_flex()
+                    .px_2()
+                    .pt_2()
+                    .pb_1()
+                    .gap_1()
+                    .items_center()
+                    .child(self.icons.file(&file.path))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .font_semibold()
+                            .truncate()
+                            .child(rel),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(file.hits.len().to_string()),
+                    )
+                    .into_any_element(),
+            );
+
+            for (hit_ix, hit) in file.hits.iter().enumerate() {
+                // 行首缩进不显示，命中区间跟着平移
+                let lead = hit.text.len() - hit.text.trim_start().len();
+                let text = &hit.text[lead..];
+                let start = hit.start.saturating_sub(lead);
+                let end = hit.end.saturating_sub(lead).max(start);
+                let before = text.get(..start).unwrap_or("").to_string();
+                let matched = text.get(start..end).unwrap_or("").to_string();
+                let after = text.get(end..).unwrap_or("").to_string();
+
+                rows.push(
+                    ListItem::new(format!("search-hit-{file_ix}-{hit_ix}"))
+                        .pl(px(22.))
+                        .pr(px(8.))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .w(px(26.))
+                                        .flex_shrink_0()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(hit.line.to_string()),
+                                )
+                                .child(
+                                    h_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_xs()
+                                        .child(div().min_w_0().truncate().child(before))
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .rounded(px(2.))
+                                                .bg(selection)
+                                                .child(matched),
+                                        )
+                                        .child(div().min_w_0().truncate().child(after)),
+                                ),
+                        )
+                        .on_click({
+                            let view = view.clone();
+                            let path = file.path.clone();
+                            let line = hit.line;
+                            move |_, window, cx| {
+                                let path = path.clone();
+                                view.update(cx, |this, cx| {
+                                    this.jump_to_hit(path.clone(), line, window, cx)
+                                });
+                            }
+                        })
+                        .into_any_element(),
+                );
+            }
+        }
+
+        let summary = if !query.trim().is_empty() && !self.search.results.is_empty() {
+            let mut text = format!("{} 处结果", self.search.total);
+            if self.search.truncated {
+                text.push_str("（结果过多，仅显示一部分）");
+            }
+            Some(text)
+        } else {
+            None
+        };
+
+        let mut list = v_flex()
+            .id("search-results")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll();
+        if let Some(summary) = summary {
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(summary),
+            );
+        }
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(form)
+            .child(list.children(rows))
             .into_any_element()
     }
 
@@ -2835,6 +3335,7 @@ impl Render for NotesApp {
             .on_action(cx.listener(Self::on_rename_selected))
             .on_action(cx.listener(Self::on_delete_selected))
             .on_action(cx.listener(Self::on_refresh))
+            .on_action(cx.listener(Self::on_focus_search))
             .child(
                 // TitleBar 默认带 12px 左内边距，这里压到一个字符宽，图标与文字之间也留一个字符宽
                 TitleBar::new().pl_2().child(
