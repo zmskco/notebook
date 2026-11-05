@@ -11,6 +11,7 @@ use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState, Position};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
+use gpui_kit::base::text::{RangeHighlight, TextViewState};
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::tree::{tree, TreeEvent, TreeState};
@@ -19,15 +20,17 @@ use gpui_kit::component::{
     WindowExt, h_flex, v_flex,
 };
 use gpui_kit::*;
-use markdown_editor::{BlockEditor, BlockEditorEvent, BlockEditorState};
+use markdown_editor::{
+    BlockEditor, BlockEditorEvent, BlockEditorState, BlockId, BlockPosition, BlockSelection,
+};
 
 use crate::file_icons::FileIcons;
 use crate::fs_ops;
 use crate::git;
 use crate::search;
 use crate::{
-    CloseTab, DeleteSelected, FocusSearch, NextTab, PrevTab, Refresh, RenameSelected, Save,
-    TogglePreview,
+    CloseTab, DeleteSelected, FocusFind, FocusSearch, NextTab, OpenReplace, PrevTab, Refresh,
+    RenameSelected, Save, TogglePreview,
 };
 
 #[derive(Clone)]
@@ -39,9 +42,14 @@ enum PromptOp {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
+    /// 所见即所得
     Edit,
-    Split,
+    /// 只看源码
+    Source,
+    /// 只看演示
     Preview,
+    /// 源码与演示对照
+    Split,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -238,6 +246,10 @@ struct Doc {
     /// 所见即所得编辑器：编辑视图使用
     wysiwyg: Entity<BlockEditorState>,
     wys_scroll: ScrollHandle,
+    /// 演示视图的渲染状态。存成实体而不是每帧新建，查找时才能给它加高亮并滚动
+    preview: Entity<TextViewState>,
+    /// 最近一次同步给演示视图的 Markdown（已做硬换行处理）
+    preview_src: String,
     /// 最近一次载入或保存时的规范 Markdown。所见即所得编辑器会把文档重新
     /// 序列化成自己的规范形式，用它当基线，打开文件才不会被误判成已修改
     baseline: String,
@@ -322,6 +334,19 @@ struct SearchPanel {
     generation: u64,
 }
 
+/// 当前文档的查找替换栏
+struct FindPanel {
+    open: bool,
+    /// 是否展开「替换为」那一行
+    show_replace: bool,
+    input: Entity<InputState>,
+    replace: Entity<InputState>,
+    case_sensitive: bool,
+    /// 当前文档里的命中，按字节区间记
+    matches: Vec<(usize, usize)>,
+    current: usize,
+}
+
 pub struct NotesApp {
     root: PathBuf,
     tree_state: Entity<TreeState>,
@@ -334,6 +359,7 @@ pub struct NotesApp {
     show_branches: bool,
     git: GitPanel,
     search: SearchPanel,
+    find: FindPanel,
     font: FontChoice,
     font_size: f32,
     theme_choice: ThemeChoice,
@@ -373,6 +399,8 @@ impl NotesApp {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("提交说明"));
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索"));
         let replace_input = cx.new(|cx| InputState::new(window, cx).placeholder("替换为"));
+        let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("查找"));
+        let find_replace_input = cx.new(|cx| InputState::new(window, cx).placeholder("替换为"));
 
         let mut this = Self {
             root,
@@ -404,6 +432,15 @@ impl NotesApp {
                 searching: false,
                 generation: 0,
             },
+            find: FindPanel {
+                open: false,
+                show_replace: false,
+                input: find_input.clone(),
+                replace: find_replace_input,
+                case_sensitive: false,
+                matches: Vec::new(),
+                current: 0,
+            },
             font: FontChoice::Hei,
             font_size: 18.,
             theme_choice: ThemeChoice::Elegant,
@@ -423,6 +460,14 @@ impl NotesApp {
             if matches!(event, InputEvent::Change) {
                 this.start_search(cx);
             }
+        })
+        .detach();
+
+        // 查找栏里输入时，实时更新当前文档的命中；回车跳到下一个
+        cx.subscribe(&find_input, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Change => this.refresh_find(cx),
+            InputEvent::PressEnter { shift, .. } => this.find_step(!*shift, cx),
+            _ => {}
         })
         .detach();
 
@@ -552,7 +597,8 @@ impl NotesApp {
     }
 
     fn make_editor(text: &str, window: &mut Window, cx: &mut Context<Self>) -> Entity<EditorState> {
-        let editor = cx.new(|cx| EditorState::new(window, cx).line_number(true));
+        let editor = cx
+            .new(|cx| EditorState::new(window, cx).line_number(true).searchable(false));
         editor.update(cx, |state, cx| state.set_value(text, window, cx));
 
         cx.subscribe(&editor, |_: &mut NotesApp, _, event: &InputEvent, cx| {
@@ -605,6 +651,8 @@ impl NotesApp {
             Ok(text) => {
                 let editor = Self::make_editor(&text, window, cx);
                 let (wysiwyg, wys_scroll) = Self::make_block_editor(&text, window, cx);
+                let preview_src = preview_source(&text);
+                let preview = cx.new(|cx| TextViewState::markdown(&preview_src, cx));
                 // 所见即所得重新序列化后会得到规范形式，与原文格式未必一致，
                 // 以它当基线，打开文件不会立刻被当成改动
                 let baseline = wysiwyg.read(cx).source();
@@ -613,6 +661,8 @@ impl NotesApp {
                     editor,
                     wysiwyg,
                     wys_scroll,
+                    preview,
+                    preview_src,
                     baseline,
                     view: ViewMode::Edit,
                 }));
@@ -674,6 +724,10 @@ impl NotesApp {
             ViewMode::Edit => doc.wysiwyg.update(cx, |state, cx| state.focus(window, cx)),
             _ => doc.editor.update(cx, |state, cx| state.focus(window, cx)),
         }
+        // 查找栏开着时，切换视图后重新落一次高亮和位置
+        if self.find.open {
+            self.refresh_find(cx);
+        }
         cx.notify();
     }
 
@@ -689,6 +743,10 @@ impl NotesApp {
         self.active = Some(ix);
         self.focus_active(window, cx);
         self.sync_selection(cx);
+        // 换了文档，查找栏里的关键词要按新文档重新算
+        if self.find.open {
+            self.refresh_find(cx);
+        }
         self.persist_session();
         cx.notify();
     }
@@ -836,9 +894,10 @@ impl NotesApp {
         };
         if let Some(Tab::File(doc)) = self.tabs.get(ix) {
             let next = match doc.view {
-                ViewMode::Edit => ViewMode::Split,
-                ViewMode::Split => ViewMode::Preview,
-                ViewMode::Preview => ViewMode::Edit,
+                ViewMode::Edit => ViewMode::Source,
+                ViewMode::Source => ViewMode::Preview,
+                ViewMode::Preview => ViewMode::Split,
+                ViewMode::Split => ViewMode::Edit,
             };
             self.switch_view(next, window, cx);
         }
@@ -1242,7 +1301,7 @@ impl NotesApp {
         cx: &mut Context<Self>,
     ) {
         self.open_file(path.clone(), window, cx);
-        self.switch_view(ViewMode::Split, window, cx);
+        self.switch_view(ViewMode::Source, window, cx);
 
         let Some(ix) = self.active else {
             return;
@@ -1390,6 +1449,274 @@ impl NotesApp {
         self.rescan(cx);
         self.refresh_git(cx);
         self.start_search(cx);
+    }
+
+    // ---------- 文档内查找替换 ----------
+
+    fn on_focus_find(&mut self, _: &FocusFind, window: &mut Window, cx: &mut Context<Self>) {
+        // 再按一次就把查找栏收起来（替换行展开时也一样）
+        if self.find.open {
+            self.close_find(window, cx);
+            return;
+        }
+        self.open_find(false, window, cx);
+    }
+
+    fn on_open_replace(&mut self, _: &OpenReplace, window: &mut Window, cx: &mut Context<Self>) {
+        // 替换行已经展开时，再按一次同样收起
+        if self.find.open && self.find.show_replace {
+            self.close_find(window, cx);
+            return;
+        }
+        self.open_find(true, window, cx);
+    }
+
+    /// 打开查找栏；`show_replace` 为真时一并展开替换那一行
+    fn open_find(&mut self, show_replace: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_doc().is_none() {
+            self.set_status("先打开一篇笔记", cx);
+            return;
+        }
+        self.find.open = true;
+        self.find.show_replace = show_replace;
+        self.find
+            .input
+            .update(cx, |state, cx| state.focus(window, cx));
+        self.refresh_find(cx);
+        cx.notify();
+    }
+
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find.open = false;
+        self.find.matches.clear();
+        self.find.current = 0;
+        self.clear_preview_highlights(cx);
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// 按查找框里的关键词重新计算当前文档的命中，并把视图滚到当前命中
+    fn refresh_find(&mut self, cx: &mut Context<Self>) {
+        let query = self.find.input.read(cx).value().to_string();
+        let case_sensitive = self.find.case_sensitive;
+
+        let matches = match self.active_doc() {
+            Some(doc) => search::occurrences(&doc.text(cx), &query, case_sensitive),
+            None => Vec::new(),
+        };
+        self.find.matches = matches;
+        if self.find.current >= self.find.matches.len() {
+            self.find.current = 0;
+        }
+
+        self.highlight_preview(cx);
+        self.apply_find_position(cx);
+        cx.notify();
+    }
+
+    /// 演示视图里把所有命中加上底色，并滚到当前命中
+    fn highlight_preview(&mut self, cx: &mut Context<Self>) {
+        let query = self.find.input.read(cx).value().to_string();
+        let case_sensitive = self.find.case_sensitive;
+        let current = self.find.current;
+
+        let Some(ix) = self.active else {
+            return;
+        };
+        let Some(Tab::File(doc)) = self.tabs.get_mut(ix) else {
+            return;
+        };
+
+        // 演示视图不在屏幕上时不用重建，清掉旧高亮就够
+        if !matches!(doc.view, ViewMode::Preview | ViewMode::Split) {
+            doc.preview
+                .update(cx, |state, cx| state.clear_range_highlights(cx));
+            return;
+        }
+
+        // 先让演示视图跟上文档的最新文本，否则算出的源区间对不上渲染结果
+        let src = preview_source(&doc.text(cx));
+        if doc.preview_src != src {
+            doc.preview_src = src.clone();
+            doc.preview.update(cx, |state, cx| state.set_text(&src, cx));
+        }
+
+        let ranges = search::occurrences(&doc.preview_src, &query, case_sensitive);
+        let target = ranges.get(current).copied();
+        let background = cx.theme().selection;
+        doc.preview.update(cx, |state, cx| {
+            let rendered = state.rendered_text();
+            let highlights: Vec<RangeHighlight> = ranges
+                .iter()
+                .filter_map(|(start, end)| rendered.range_for_source(*start..*end))
+                .map(|range| RangeHighlight::new(range, background))
+                .collect();
+            let _ = state.set_range_highlights(highlights, cx);
+            if let Some(range) =
+                target.and_then(|(start, end)| rendered.range_for_source(start..end))
+            {
+                let _ = state.reveal_range(range, cx);
+            }
+        });
+    }
+
+    /// 把当前命中定位到编辑器里（演示视图由 highlight_preview 负责滚动）
+    fn apply_find_position(&mut self, cx: &mut Context<Self>) {
+        let query = self.find.input.read(cx).value().to_string();
+        let case_sensitive = self.find.case_sensitive;
+        let index = self.find.current;
+        let range = self.find.matches.get(index).copied();
+
+        let Some(ix) = self.active else {
+            return;
+        };
+        let Some(Tab::File(doc)) = self.tabs.get_mut(ix) else {
+            return;
+        };
+
+        match doc.view {
+            ViewMode::Preview => {}
+            ViewMode::Source | ViewMode::Split => {
+                if let Some((start, end)) = range {
+                    // 命中是上次刷新时算的，文本可能已经改过，越界先跳过
+                    if doc.editor.read(cx).value().get(start..end).is_some() {
+                        doc.editor
+                            .update(cx, |state, cx| state.set_selected_range(start..end, cx));
+                    }
+                }
+            }
+            ViewMode::Edit => {
+                // 块编辑器的选中位置按「块 + 字符偏移」记，这里按文档顺序把
+                // 源文本里的第 index 个命中换算成块内位置
+                let mut remaining = index;
+                let mut target: Option<(BlockId, usize, usize)> = None;
+                {
+                    let state = doc.wysiwyg.read(cx);
+                    for block in state.model().document().leaves() {
+                        let Some(text) = block.text() else {
+                            continue;
+                        };
+                        for (start, end) in search::occurrences(text, &query, case_sensitive) {
+                            if remaining == 0 {
+                                target = Some((
+                                    block.id(),
+                                    text[..start].chars().count(),
+                                    text[..end].chars().count(),
+                                ));
+                                break;
+                            }
+                            remaining -= 1;
+                        }
+                        if target.is_some() {
+                            break;
+                        }
+                    }
+                }
+                if let Some((block, anchor, head)) = target {
+                    doc.wysiwyg.update(cx, |state, cx| {
+                        let selection = BlockSelection::Text {
+                            anchor: BlockPosition::new(block, anchor),
+                            head: BlockPosition::new(block, head),
+                        };
+                        if state.set_selection(selection, cx).is_ok() {
+                            state.reveal_caret(cx);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let count = self.find.matches.len();
+        if count == 0 {
+            return;
+        }
+        self.find.current = if forward {
+            (self.find.current + 1) % count
+        } else {
+            (self.find.current + count - 1) % count
+        };
+        self.highlight_preview(cx);
+        self.apply_find_position(cx);
+        cx.notify();
+    }
+
+    fn clear_preview_highlights(&mut self, cx: &mut Context<Self>) {
+        let Some(doc) = self.active_doc() else {
+            return;
+        };
+        doc.preview
+            .update(cx, |state, cx| state.clear_range_highlights(cx));
+    }
+
+    /// 替换后写回两个编辑器，并让演示视图在下次渲染时重新同步
+    fn set_doc_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.active else {
+            return;
+        };
+        let Some(Tab::File(doc)) = self.tabs.get_mut(ix) else {
+            return;
+        };
+        doc.editor
+            .update(cx, |state, cx| state.set_value(text.clone(), window, cx));
+        doc.wysiwyg
+            .update(cx, |state, cx| state.set_source(&text, cx).ok());
+        doc.preview_src.clear();
+        cx.notify();
+    }
+
+    /// 只替换当前这一处，替换完停在同一位置（也就是下一个命中）
+    fn replace_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.find.input.read(cx).value().to_string();
+        let replacement = self.find.replace.read(cx).value().to_string();
+        if query.is_empty() {
+            return;
+        }
+        let Some((start, end)) = self.find.matches.get(self.find.current).copied() else {
+            self.set_status("没有可替换的命中", cx);
+            return;
+        };
+        let Some(doc) = self.active_doc() else {
+            return;
+        };
+        let text = doc.text(cx);
+        // 命中是上次刷新时算的，文本若已改动，位置就作废了，重新算一遍
+        if text.get(start..end).is_none() {
+            self.refresh_find(cx);
+            return;
+        }
+
+        let mut new_text = String::with_capacity(text.len() + replacement.len());
+        new_text.push_str(&text[..start]);
+        new_text.push_str(&replacement);
+        new_text.push_str(&text[end..]);
+
+        self.set_doc_text(new_text, window, cx);
+        self.refresh_find(cx);
+        self.set_status("已替换 1 处", cx);
+    }
+
+    fn replace_all_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.find.input.read(cx).value().to_string();
+        let replacement = self.find.replace.read(cx).value().to_string();
+        if query.is_empty() {
+            return;
+        }
+        let case_sensitive = self.find.case_sensitive;
+        let Some(doc) = self.active_doc() else {
+            return;
+        };
+        let (new_text, count) =
+            search::replace(&doc.text(cx), &query, &replacement, case_sensitive);
+        if count == 0 {
+            self.set_status("没有可替换的命中", cx);
+            return;
+        }
+
+        self.set_doc_text(new_text, window, cx);
+        self.refresh_find(cx);
+        self.set_status(format!("已替换 {count} 处"), cx);
     }
 
     // ---------- Git ----------
@@ -2826,6 +3153,177 @@ impl NotesApp {
 
     // ---------- 渲染：编辑区 ----------
 
+    /// 文档内查找替换栏，打开时占据工具栏下方的一行
+    fn render_find_bar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.find.open {
+            return None;
+        }
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let view = cx.entity();
+
+        let input = self.find.input.clone();
+        let replace_input = self.find.replace.clone();
+        let case_sensitive = self.find.case_sensitive;
+        let show_replace = self.find.show_replace;
+        let total = self.find.matches.len();
+        let counter = if total == 0 {
+            "无结果".to_string()
+        } else {
+            format!("{}/{}", self.find.current + 1, total)
+        };
+
+        let row = h_flex()
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .items_center()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                div()
+                    .w(px(220.))
+                    .flex_shrink_0()
+                    .child(Input::new(&input).cleanable(true)),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .min_w(px(56.))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(counter),
+            )
+            .child(
+                Button::new("find-prev")
+                    .ghost()
+                    .small()
+                    .icon(IconName::ChevronUp)
+                    .tooltip("上一个（Shift+Enter）")
+                    .disabled(total == 0)
+                    .on_click({
+                        let view = view.clone();
+                        move |_, _, cx| view.update(cx, |this, cx| this.find_step(false, cx))
+                    }),
+            )
+            .child(
+                Button::new("find-next")
+                    .ghost()
+                    .small()
+                    .icon(IconName::ChevronDown)
+                    .tooltip("下一个（Enter）")
+                    .disabled(total == 0)
+                    .on_click({
+                        let view = view.clone();
+                        move |_, _, cx| view.update(cx, |this, cx| this.find_step(true, cx))
+                    }),
+            )
+            .child(
+                Button::new("find-case")
+                    .ghost()
+                    .small()
+                    .selected(case_sensitive)
+                    .icon(IconName::CaseSensitive)
+                    .tooltip("区分大小写")
+                    .on_click({
+                        let view = view.clone();
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| {
+                                this.find.case_sensitive = !this.find.case_sensitive;
+                                this.refresh_find(cx);
+                            })
+                        }
+                    }),
+            )
+            .child(
+                Button::new("find-toggle-replace")
+                    .ghost()
+                    .small()
+                    .selected(show_replace)
+                    .icon(IconName::Replace)
+                    .tooltip("替换")
+                    .on_click({
+                        let view = view.clone();
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| {
+                                this.find.show_replace = !this.find.show_replace;
+                                cx.notify();
+                            })
+                        }
+                    }),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("find-close")
+                    .ghost()
+                    .small()
+                    .icon(IconName::X)
+                    .tooltip("关闭")
+                    .on_click({
+                        let view = view.clone();
+                        move |_, window, cx| {
+                            view.update(cx, |this, cx| this.close_find(window, cx))
+                        }
+                    }),
+            );
+
+        let replace_row = show_replace.then(|| {
+            let view = view.clone();
+            h_flex()
+                .w_full()
+                .px_2()
+                .pb_1()
+                .gap_1()
+                .items_center()
+                .border_b_1()
+                .border_color(border)
+                .child(
+                    div()
+                        .w(px(220.))
+                        .flex_shrink_0()
+                        .child(Input::new(&replace_input)),
+                )
+                .child(
+                    Button::new("find-replace-one")
+                        .ghost()
+                        .small()
+                        .label("替换")
+                        .disabled(total == 0)
+                        .on_click({
+                            let view = view.clone();
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| this.replace_current(window, cx))
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("find-replace-all")
+                        .ghost()
+                        .small()
+                        .label("全部替换")
+                        .disabled(total == 0)
+                        .on_click({
+                            let view = view.clone();
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| this.replace_all_find(window, cx))
+                            }
+                        }),
+                )
+                .into_any_element()
+        });
+
+        Some(
+            v_flex()
+                .w_full()
+                .flex_shrink_0()
+                .bg(cx.theme().background)
+                .child(row)
+                .children(replace_row)
+                .into_any_element(),
+        )
+    }
+
     fn render_main(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
@@ -2988,6 +3486,9 @@ impl NotesApp {
                     })
             });
 
+        let find_open = self.find.open;
+        let find_replace = self.find.open && self.find.show_replace;
+
         let style_bar = h_flex()
             .w_full()
             .h(px(34.))
@@ -3004,7 +3505,57 @@ impl NotesApp {
             .child(div().w(px(1.)).h_4().bg(border).mx_1())
             .children(theme_buttons)
             .child(div().w(px(1.)).h_4().bg(border).mx_1())
-            .children(width_buttons);
+            .children(width_buttons)
+            .child(div().w(px(1.)).h_4().bg(border).mx_1())
+            .child(
+                Button::new("find-open")
+                    .ghost()
+                    .small()
+                    .label("查找")
+                    .tooltip("在本文档里查找（Ctrl+F）")
+                    .selected(find_open && !find_replace)
+                    .disabled(!is_file)
+                    .on_click({
+                        let view = view.clone();
+                        move |_, window, cx| {
+                            view.update(cx, |this, cx| {
+                                if this.find.open && this.find.show_replace {
+                                    // 替换行还在，就只把它收起来，查找行留着
+                                    this.find.show_replace = false;
+                                    this.find
+                                        .input
+                                        .update(cx, |state, cx| state.focus(window, cx));
+                                    this.refresh_find(cx);
+                                } else if this.find.open {
+                                    this.close_find(window, cx);
+                                } else {
+                                    this.open_find(false, window, cx);
+                                }
+                            })
+                        }
+                    }),
+            )
+            .child(
+                Button::new("find-replace")
+                    .ghost()
+                    .small()
+                    .label("替换")
+                    .tooltip("在本文档里替换（Ctrl+H）")
+                    .selected(find_replace)
+                    .disabled(!is_file)
+                    .on_click({
+                        let view = view.clone();
+                        move |_, window, cx| {
+                            view.update(cx, |this, cx| {
+                                if this.find.open && this.find.show_replace {
+                                    this.close_find(window, cx);
+                                } else {
+                                    this.open_find(true, window, cx);
+                                }
+                            })
+                        }
+                    }),
+            );
 
         let toolbar = h_flex()
             .px_2()
@@ -3029,17 +3580,19 @@ impl NotesApp {
                     }),
             )
             .child(
-                Button::new("mode-split")
+                Button::new("mode-source")
                     .ghost()
                     .small()
-                    .selected(mode == ViewMode::Split)
-                    .icon(IconName::SquareSplitHorizontal)
-                    .tooltip("编辑 + 演示")
+                    .selected(mode == ViewMode::Source)
+                    .icon(IconName::Code)
+                    .tooltip("源码")
                     .disabled(!is_file)
                     .on_click({
                         let view = view.clone();
                         move |_, window, cx| {
-                            view.update(cx, |this, cx| this.switch_view(ViewMode::Split, window, cx))
+                            view.update(cx, |this, cx| {
+                                this.switch_view(ViewMode::Source, window, cx)
+                            })
                         }
                     }),
             )
@@ -3049,7 +3602,7 @@ impl NotesApp {
                     .small()
                     .selected(mode == ViewMode::Preview)
                     .icon(IconName::Eye)
-                    .tooltip("演示（Ctrl+Shift+V 切换）")
+                    .tooltip("演示（Ctrl+Shift+V 轮换）")
                     .disabled(!is_file)
                     .on_click({
                         let view = view.clone();
@@ -3057,6 +3610,21 @@ impl NotesApp {
                             view.update(cx, |this, cx| {
                                 this.switch_view(ViewMode::Preview, window, cx)
                             })
+                        }
+                    }),
+            )
+            .child(
+                Button::new("mode-split")
+                    .ghost()
+                    .small()
+                    .selected(mode == ViewMode::Split)
+                    .icon(IconName::SquareSplitHorizontal)
+                    .tooltip("对照")
+                    .disabled(!is_file)
+                    .on_click({
+                        let view = view.clone();
+                        move |_, window, cx| {
+                            view.update(cx, |this, cx| this.switch_view(ViewMode::Split, window, cx))
                         }
                     }),
             )
@@ -3076,13 +3644,26 @@ impl NotesApp {
                     }),
             );
 
+        // 演示视图在渲染前跟上文档的最新文本：在所见即所得里改过字之后，
+        // 切到演示或做查找高亮才对得上
+        if let Some(ix) = self.active
+            && let Some(Tab::File(doc)) = self.tabs.get_mut(ix)
+            && matches!(doc.view, ViewMode::Preview | ViewMode::Split)
+        {
+            let src = preview_source(&doc.text(cx));
+            if doc.preview_src != src {
+                doc.preview_src = src.clone();
+                doc.preview.update(cx, |state, cx| state.set_text(&src, cx));
+            }
+        }
+
         let content_width = px(self.column_width.max_width());
         let body: AnyElement = match self.active.and_then(|ix| self.tabs.get(ix)) {
             Some(Tab::File(doc)) => {
                 let editor = doc.editor.clone();
                 let wysiwyg = doc.wysiwyg.clone();
                 let wys_scroll = doc.wys_scroll.clone();
-                let text = doc.text(cx);
+                let preview = doc.preview.clone();
                 let mode = doc.view;
                 match mode {
                     // 所见即所得：直接按 Markdown 渲染，点哪里就在哪里编辑
@@ -3103,6 +3684,22 @@ impl NotesApp {
                                 .font_family(font_family.clone())
                                 .text_size(px(font_size))
                                 .child(BlockEditor::new(&wysiwyg).min_h_full()),
+                        )
+                        .into_any_element(),
+                    // 源码：只显示 Markdown 原文，适合精修格式
+                    ViewMode::Source => div()
+                        .flex_1()
+                        .h_full()
+                        .min_h_0()
+                        .w_full()
+                        .overflow_hidden()
+                        .px_6()
+                        .py_4()
+                        .child(
+                            Editor::new(&editor)
+                                .h_full()
+                                .font_family(font_family.clone())
+                                .text_size(px(font_size)),
                         )
                         .into_any_element(),
                     ViewMode::Split => h_flex()
@@ -3166,11 +3763,7 @@ impl NotesApp {
                                         .max_w(content_width)
                                         .mx_auto()
                                         .child(
-                                            TextView::markdown(
-                                                "preview-split",
-                                                preview_source(&text),
-                                            )
-                                            .selectable(true),
+                                            TextView::new(&preview).selectable(true),
                                         ),
                                 ),
                         )
@@ -3188,10 +3781,7 @@ impl NotesApp {
                                 .w_full()
                                 .max_w(content_width)
                                 .mx_auto()
-                                .child(
-                                    TextView::markdown("preview-only", preview_source(&text))
-                                        .selectable(true),
-                                ),
+                                .child(TextView::new(&preview).selectable(true)),
                         )
                         .into_any_element(),
                 }
@@ -3247,6 +3837,8 @@ impl NotesApp {
                 .into_any_element(),
         };
 
+        let find_bar = self.render_find_bar(cx);
+
         v_flex()
             .flex_1()
             .min_w_0()
@@ -3262,6 +3854,7 @@ impl NotesApp {
                     .child(tab_strip)
                     .child(toolbar),
             )
+            .children(find_bar)
             .child(v_flex().flex_1().min_h_0().w_full().child(body))
             .into_any_element()
     }
@@ -3336,6 +3929,8 @@ impl Render for NotesApp {
             .on_action(cx.listener(Self::on_delete_selected))
             .on_action(cx.listener(Self::on_refresh))
             .on_action(cx.listener(Self::on_focus_search))
+            .on_action(cx.listener(Self::on_focus_find))
+            .on_action(cx.listener(Self::on_open_replace))
             .child(
                 // TitleBar 默认带 12px 左内边距，这里压到一个字符宽，图标与文字之间也留一个字符宽
                 TitleBar::new().pl_2().child(

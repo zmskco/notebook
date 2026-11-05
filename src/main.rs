@@ -4,7 +4,7 @@
 // 界面：
 //   - 左侧栏：资源管理器 / 搜索 / 源代码管理（Git）三个视图
 //   - 资源管理器：目录树，右键可新建 / 重命名 / 删除，可切换工作区
-//   - 编辑区：多标签，默认所见即所得，可切到「编辑 + 演示」或「演示」
+//   - 编辑区：多标签，默认所见即所得，可切到「源码 / 演示 / 对照」
 //   - 状态栏：提示信息 / 当前文档字数 / 行数 / 保存状态
 //
 // 快捷键：
@@ -12,7 +12,9 @@
 //   Ctrl+W           关闭当前标签
 //   Ctrl+Tab         下一个标签
 //   Ctrl+Shift+Tab   上一个标签
-//   Ctrl+Shift+V     切换 编辑 / 编辑 + 演示 / 演示
+//   Ctrl+Shift+V     切换 所见即所得 / 源码 / 演示 / 对照
+//   Ctrl+F           在当前文档里查找
+//   Ctrl+H           在当前文档里替换
 //   Ctrl+Shift+F     打开全局搜索
 //   F2               重命名目录树中选中的文件
 //   Delete           删除目录树中选中的文件（焦点在目录树上时）
@@ -45,6 +47,8 @@ actions!(
         DeleteSelected,
         Refresh,
         FocusSearch,
+        FocusFind,
+        OpenReplace,
     ]
 );
 
@@ -73,6 +77,8 @@ fn main() {
                 KeyBinding::new("ctrl-shift-tab", PrevTab, Some("NotesApp")),
                 KeyBinding::new("ctrl-shift-v", TogglePreview, Some("NotesApp")),
                 KeyBinding::new("ctrl-shift-f", FocusSearch, Some("NotesApp")),
+                KeyBinding::new("ctrl-f", FocusFind, Some("NotesApp")),
+                KeyBinding::new("ctrl-h", OpenReplace, Some("NotesApp")),
                 KeyBinding::new("f5", Refresh, Some("NotesApp")),
                 // 只有焦点在目录树上时才生效，避免误删编辑器内容
                 KeyBinding::new("f2", RenameSelected, Some("Tree")),

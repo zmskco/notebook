@@ -149,6 +149,23 @@ fn find_ci(hay: &str, needle: &str) -> Option<(usize, usize)> {
     None
 }
 
+/// 查找 needle 在 hay 里的全部位置，返回字节区间
+pub fn occurrences(hay: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    if needle.is_empty() {
+        return ranges;
+    }
+    let mut rest = hay;
+    let mut offset = 0;
+    while let Some((start, end)) = find(rest, needle, case_sensitive) {
+        ranges.push((offset + start, offset + end));
+        // 从命中结尾继续找；needle 非空，end 必然大于 start
+        rest = &rest[end..];
+        offset += end;
+    }
+    ranges
+}
+
 /// 替换文本里的全部命中，返回新文本与替换次数
 pub fn replace(text: &str, needle: &str, replacement: &str, case_sensitive: bool) -> (String, usize) {
     if needle.is_empty() {
