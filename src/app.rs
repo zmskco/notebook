@@ -21,6 +21,7 @@ use gpui_kit::component::{
 use gpui_kit::*;
 use markdown_editor::{BlockEditor, BlockEditorEvent, BlockEditorState};
 
+use crate::file_icons::FileIcons;
 use crate::fs_ops;
 use crate::git;
 use crate::{CloseTab, DeleteSelected, NextTab, PrevTab, Refresh, RenameSelected, Save, TogglePreview};
@@ -148,7 +149,22 @@ struct Palette {
     border: u32,
     panel: u32,
     accent: u32,
-    selection: u32,
+}
+
+/// 四种配色共用的强调色：靛蓝 #3b82f6。只调不透明度，色相始终一致。
+/// 浅色底 30% 已是清晰色块；深色底要 45%，30% 会被底色吃掉。
+const ACCENT_RGB: u32 = 0x3b82f6;
+const SELECTION_ALPHA_LIGHT: u32 = 0x4d;
+const SELECTION_ALPHA_DARK: u32 = 0x73;
+/// 悬停态用同色更淡的一档，深色主题同样略加重
+const HOVER_ALPHA_LIGHT: u32 = 0x2b;
+const HOVER_ALPHA_DARK: u32 = 0x52;
+/// ghost 按钮的悬停底在深色主题会被再乘 0.5，这里补一档更浓的
+const GHOST_HOVER_ALPHA_DARK: u32 = 0x66;
+
+/// 拼出不透明的十六进制色值 + 不透明度，得到 rgba(0xRRGGBBAA)
+fn tint(alpha: u32) -> u32 {
+    (ACCENT_RGB << 8) | alpha
 }
 
 impl ThemeChoice {
@@ -177,7 +193,6 @@ impl ThemeChoice {
                 border: 0xe4e6ea,
                 panel: 0xf7f8f9,
                 accent: 0xeceef1,
-                selection: 0xdbe7f6,
             },
             Self::Elegant => Palette {
                 background: 0xfaf7f0,
@@ -187,7 +202,6 @@ impl ThemeChoice {
                 border: 0xe4ddcf,
                 panel: 0xf5f1e7,
                 accent: 0xebe4d4,
-                selection: 0xe6dcc4,
             },
             Self::Night => Palette {
                 background: 0x1c1d1f,
@@ -197,7 +211,6 @@ impl ThemeChoice {
                 border: 0x323437,
                 panel: 0x212225,
                 accent: 0x2f3236,
-                selection: 0x34495f,
             },
             Self::Meadow => Palette {
                 background: 0xf2f8ee,
@@ -207,7 +220,6 @@ impl ThemeChoice {
                 border: 0xd6e4ce,
                 panel: 0xecf4e6,
                 accent: 0xdfecd5,
-                selection: 0xcfe3c3,
             },
         }
     }
@@ -313,11 +325,14 @@ pub struct NotesApp {
     pending_open: Option<PathBuf>,
     wenkai_family: SharedString,
     puhuiti_family: SharedString,
+    /// 目录树与标签栏使用的彩色文件图标
+    icons: FileIcons,
 }
 
 impl NotesApp {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (wenkai_family, puhuiti_family) = load_reading_fonts(cx);
+        let icons = FileIcons::new(cx);
         let session = fs_ops::load_session();
         let expanded = HashSet::new();
         let items = fs_ops::build_items(&root, &expanded);
@@ -343,7 +358,7 @@ impl NotesApp {
             tabs: Vec::new(),
             active: None,
             prompt_op: None,
-            status: "Ctrl+S 保存 · Ctrl+W 关闭标签 · Ctrl+Tab 切换 · F2 重命名".into(),
+            status: "".into(),
             sidebar: SidebarView::Explorer,
             show_branches: false,
             git: GitPanel {
@@ -364,6 +379,7 @@ impl NotesApp {
             pending_open: None,
             wenkai_family,
             puhuiti_family,
+            icons,
         };
         this.apply_theme(ThemeChoice::Elegant, cx);
         this.refresh_git(cx);
@@ -435,6 +451,11 @@ impl NotesApp {
         // 先切模式（会重新载入内置配色），再覆盖成本应用的配色
         Theme::change(mode, None, cx);
         let palette = choice.palette();
+        // 深色底需要更浓的一档，否则强调色会被背景吃掉
+        let dark = choice.is_dark();
+        let selection = tint(if dark { SELECTION_ALPHA_DARK } else { SELECTION_ALPHA_LIGHT });
+        let hover = tint(if dark { HOVER_ALPHA_DARK } else { HOVER_ALPHA_LIGHT });
+        let ghost_hover = tint(if dark { GHOST_HOVER_ALPHA_DARK } else { HOVER_ALPHA_LIGHT });
         Theme::update(cx, |theme| {
             let colors = &mut theme.colors;
             colors.background = rgb(palette.background).into();
@@ -443,9 +464,10 @@ impl NotesApp {
             colors.muted_foreground = rgb(palette.muted_foreground).into();
             colors.border = rgb(palette.border).into();
             colors.input = rgb(palette.background).into();
-            colors.accent = rgb(palette.accent).into();
+            // accent 是 ghost 按钮的悬停底，换成强调色的淡色，深色主题才看得出按钮边界
+            colors.accent = rgba(ghost_hover).into();
             colors.accent_foreground = rgb(palette.foreground).into();
-            colors.selection = rgb(palette.selection).into();
+            colors.selection = rgba(selection).into();
             colors.caret = rgb(palette.foreground).into();
             colors.sidebar = rgb(palette.panel).into();
             colors.sidebar_foreground = rgb(palette.foreground).into();
@@ -462,16 +484,18 @@ impl NotesApp {
             colors.status_bar = rgb(palette.panel).into();
             colors.status_bar_border = rgb(palette.border).into();
             colors.list = rgb(palette.background).into();
-            colors.list_hover = rgb(palette.accent).into();
-            colors.list_active = rgb(palette.accent).into();
+            colors.list_hover = rgba(hover).into();
+            colors.list_active = rgba(selection).into();
             colors.list_even = rgb(palette.muted).into();
             colors.popover = rgb(palette.background).into();
             colors.popover_foreground = rgb(palette.foreground).into();
             colors.scrollbar_thumb = rgb(palette.border).into();
             colors.button = rgb(palette.muted).into();
-            colors.button_hover = rgb(palette.accent).into();
-            colors.button_active = rgb(palette.accent).into();
+            colors.button_hover = rgba(hover).into();
+            colors.button_active = rgba(selection).into();
             colors.button_foreground = rgb(palette.foreground).into();
+            // ghost 按钮的 selected 态取 secondary_active，工具栏的字体/字号/背景/宽度按钮全靠它
+            colors.secondary_active = rgba(selection).into();
         });
         cx.notify();
     }
@@ -1502,6 +1526,7 @@ impl NotesApp {
         let tree_view = view.clone();
         let focus_state = self.tree_state.clone();
         let menu_tree = self.tree_state.clone();
+        let tree_icons = self.icons.clone();
         let tree_element = tree(&tree_state, move |ix, entry, _selected, _window, _cx| {
             let id = entry.item().id.to_string();
             let path = PathBuf::from(&id);
@@ -1509,13 +1534,9 @@ impl NotesApp {
             let opened = !is_folder && open_dirty.contains(&id);
 
             let icon = if is_folder {
-                if entry.is_expanded() {
-                    IconName::FolderOpen
-                } else {
-                    IconName::Folder
-                }
+                tree_icons.folder(entry.is_expanded())
             } else {
-                file_icon(&path)
+                tree_icons.file(&path)
             };
 
             // ListItem 内部是块级容器，多个子元素会纵向堆叠，这里统一包一层横向布局
@@ -1523,7 +1544,7 @@ impl NotesApp {
                 .w_full()
                 .gap_2()
                 .items_center()
-                .child(Icon::new(icon).size_4())
+                .child(icon)
                 .child(
                     div()
                         .flex_1()
@@ -2317,6 +2338,7 @@ impl NotesApp {
         let tab_active_fg = cx.theme().tab_active_foreground;
 
         // 自绘标签条：4px + 图标 + 4px + 文件名 + 关闭按钮
+        let tab_icons = self.icons.clone();
         let tab_strip = h_flex()
             .id("tab-strip")
             .flex_1()
@@ -2328,10 +2350,7 @@ impl NotesApp {
             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
                 let title = tab.title();
                 let dirty = tab.dirty(cx);
-                let icon = match tab {
-                    Tab::File(_) => IconName::FileText,
-                    Tab::Diff { .. } => IconName::FileDiff,
-                };
+                let icon = tab_icons.tab(tab.path());
                 let selected = self.active == Some(ix);
                 let close_view = view.clone();
                 let click_view = view.clone();
@@ -2352,7 +2371,7 @@ impl NotesApp {
                     tab_el = tab_el.bg(tab_bg);
                 }
                 tab_el
-                    .child(Icon::new(icon).size_4())
+                    .child(icon)
                     .children(dirty.then(|| div().text_xs().child("●")))
                     .child(
                         div()
@@ -2752,7 +2771,6 @@ impl NotesApp {
     fn render_status_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
-        let success = cx.theme().success;
 
         let detail = match self.active.and_then(|ix| self.tabs.get(ix)) {
             Some(Tab::File(doc)) => {
@@ -2776,9 +2794,20 @@ impl NotesApp {
             .border_color(border)
             .text_xs()
             .text_color(muted)
-            .child(Icon::new(IconName::Check).size_3p5().text_color(success))
-            .child(div().flex_1().truncate().child(self.status.clone()))
-            .child(div().child(detail))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(self.root.to_string_lossy().to_string()),
+            )
+            .children((!self.status.is_empty()).then(|| {
+                div()
+                    .max_w(px(380.))
+                    .truncate()
+                    .child(self.status.clone())
+            }))
+            .child(div().whitespace_nowrap().child(detail))
             .into_any_element()
     }
 }
@@ -2792,7 +2821,6 @@ impl Render for NotesApp {
 
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
-        let muted = cx.theme().muted_foreground;
 
         v_flex()
             .size_full()
@@ -2816,14 +2844,7 @@ impl Render for NotesApp {
                         .gap_2()
                         .items_center()
                         .child(Icon::new(IconName::NotebookPen).size_4())
-                        .child(div().text_sm().font_semibold().child("笔记本"))
-                        .child(div().flex_1())
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(self.root.to_string_lossy().to_string()),
-                        ),
+                        .child(div().text_sm().font_semibold().child("笔记本")),
                 ),
             )
             .child(
@@ -2901,31 +2922,6 @@ fn preview_source(text: &str) -> String {
         out.pop();
     }
     out
-}
-
-/// 按扩展名挑图标
-fn file_icon(path: &Path) -> IconName {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-
-    if name.ends_with(".gitignore") || name.ends_with(".gitattributes") {
-        IconName::FileCog
-    } else {
-        match ext.as_str() {
-            "md" | "markdown" => IconName::FileText,
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" => IconName::FileImage,
-            "toml" | "json" | "yaml" | "yml" | "lock" => IconName::FileBraces,
-            "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "java" | "c" | "cpp" | "h" | "sh" => {
-                IconName::FileCode
-            }
-            "csv" | "tsv" | "xlsx" | "xls" => IconName::FileSpreadsheet,
-            "diff" | "patch" => IconName::FileDiff,
-            _ => IconName::File,
-        }
-    }
 }
 
 /// 内嵌的阅读字体：编译期直接打包进可执行文件，不依赖外部 ttf
