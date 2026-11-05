@@ -221,7 +221,9 @@ struct Doc {
     /// 所见即所得编辑器：编辑视图使用
     wysiwyg: Entity<BlockEditorState>,
     wys_scroll: ScrollHandle,
-    saved: String,
+    /// 最近一次载入或保存时的规范 Markdown。所见即所得编辑器会把文档重新
+    /// 序列化成自己的规范形式，用它当基线，打开文件才不会被误判成已修改
+    baseline: String,
     view: ViewMode,
 }
 
@@ -234,9 +236,9 @@ impl Doc {
         }
     }
 
-    /// 所见即所得往返会去掉结尾空行，比较时忽略行尾空白
+    /// 与基线比较，忽略结尾空行（所见即所得往返会去掉尾部空行）
     fn is_dirty(&self, cx: &App) -> bool {
-        self.text(cx).trim_end() != self.saved.trim_end()
+        self.text(cx).trim_end() != self.baseline.trim_end()
     }
 }
 
@@ -316,6 +318,7 @@ pub struct NotesApp {
 impl NotesApp {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (wenkai_family, puhuiti_family) = load_reading_fonts(cx);
+        let session = fs_ops::load_session();
         let expanded = HashSet::new();
         let items = fs_ops::build_items(&root, &expanded);
         let tree_state = cx.new(|cx| TreeState::new(cx).items(items));
@@ -365,20 +368,50 @@ impl NotesApp {
         this.apply_theme(ThemeChoice::Elegant, cx);
         this.refresh_git(cx);
 
-        // 首次运行（工作区为空）时生成欢迎文档，并把它作为启动页打开
-        let welcome = this.root.join(fs_ops::WELCOME_NAME);
-        if !welcome.exists() && fs_ops::is_empty_dir(&this.root) {
-            let _ = fs_ops::write_welcome(&this.root);
+        // 恢复上次打开的文档，已经删除的文件直接跳过
+        let mut restored = 0;
+        if let Some(session) = &session {
+            for path in &session.files {
+                if path.is_file() {
+                    this.open_file(path.clone(), window, cx);
+                    restored += 1;
+                }
+            }
         }
-        if welcome.exists() {
-            this.open_file(welcome, window, cx);
+        if restored > 0 {
+            if let Some(ix) = session.as_ref().and_then(|s| s.active) {
+                if ix < this.tabs.len() {
+                    this.active = Some(ix);
+                    this.focus_active(window, cx);
+                }
+            }
+        } else {
+            // 首次运行（工作区为空）时生成欢迎文档，并把它作为启动页打开
+            let welcome = this.root.join(fs_ops::WELCOME_NAME);
+            if !welcome.exists() && fs_ops::is_empty_dir(&this.root) {
+                let _ = fs_ops::write_welcome(&this.root);
+            }
+            if welcome.exists() {
+                this.open_file(welcome, window, cx);
+            }
         }
+        this.persist_session();
         this
     }
 
     fn set_status(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.status = message.into();
         cx.notify();
+    }
+
+    /// 把工作区与当前打开的文档写回会话文件
+    fn persist_session(&self) {
+        let files: Vec<PathBuf> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.path().map(Path::to_path_buf))
+            .collect();
+        fs_ops::save_session(&self.root, &files, self.active);
     }
 
     // ---------- 排版 ----------
@@ -506,12 +539,15 @@ impl NotesApp {
             Ok(text) => {
                 let editor = Self::make_editor(&text, window, cx);
                 let (wysiwyg, wys_scroll) = Self::make_block_editor(&text, window, cx);
+                // 所见即所得重新序列化后会得到规范形式，与原文格式未必一致，
+                // 以它当基线，打开文件不会立刻被当成改动
+                let baseline = wysiwyg.read(cx).source();
                 self.tabs.push(Tab::File(Doc {
                     path: path.clone(),
                     editor,
                     wysiwyg,
                     wys_scroll,
-                    saved: text,
+                    baseline,
                     view: ViewMode::Edit,
                 }));
                 self.active = Some(self.tabs.len() - 1);
@@ -519,6 +555,7 @@ impl NotesApp {
                 self.rescan(cx);
                 self.focus_active(window, cx);
                 self.sync_selection(cx);
+                self.persist_session();
                 cx.notify();
             }
             Err(err) => self.set_status(format!("打开失败：{err}"), cx),
@@ -559,6 +596,11 @@ impl NotesApp {
             let text = doc.editor.read(cx).value().to_string();
             doc.wysiwyg
                 .update(cx, |state, cx| state.set_source(&text, cx).ok());
+            // 源码视图没有实际改动时，把基线换成重新规范化后的文本，
+            // 免得只是切了一下视图就被标记成已修改
+            if text.trim_end() == doc.baseline.trim_end() {
+                doc.baseline = doc.wysiwyg.read(cx).source();
+            }
         }
 
         doc.view = view;
@@ -581,6 +623,7 @@ impl NotesApp {
         self.active = Some(ix);
         self.focus_active(window, cx);
         self.sync_selection(cx);
+        self.persist_session();
         cx.notify();
     }
 
@@ -588,16 +631,15 @@ impl NotesApp {
         let Some(Tab::File(doc)) = self.tabs.get_mut(ix) else {
             return false;
         };
+        // 没有真正编辑过就不写盘，避免把文件整体重排成另一种写法
+        if !doc.is_dirty(cx) {
+            return true;
+        }
         let text = doc.text(cx);
-        let result = if text.trim_end() == doc.saved.trim_end() {
-            Ok(())
-        } else {
-            std::fs::write(&doc.path, &text)
-        };
 
-        match result {
+        match std::fs::write(&doc.path, &text) {
             Ok(_) => {
-                doc.saved = text;
+                doc.baseline = text;
                 true
             }
             Err(err) => {
@@ -690,6 +732,7 @@ impl NotesApp {
             self.focus_active(window, cx);
         }
         self.sync_selection(cx);
+        self.persist_session();
         cx.notify();
     }
 
@@ -961,6 +1004,8 @@ impl NotesApp {
                 }
             }
         }
+
+        self.persist_session();
     }
 
     // ---------- 删除 ----------
@@ -1035,6 +1080,7 @@ impl NotesApp {
                 }
                 self.rescan(cx);
                 self.sync_selection(cx);
+                self.persist_session();
                 self.set_status("已删除", cx);
                 self.refresh_git(cx);
             }
@@ -1104,6 +1150,7 @@ impl NotesApp {
 
         self.refresh_git(cx);
         let label = self.root.display().to_string();
+        self.persist_session();
         self.set_status(format!("工作区：{label}"), cx);
     }
 
@@ -2600,8 +2647,11 @@ impl NotesApp {
                                         .max_w(content_width)
                                         .mx_auto()
                                         .child(
-                                            TextView::markdown("preview-split", text)
-                                                .selectable(true),
+                                            TextView::markdown(
+                                                "preview-split",
+                                                preview_source(&text),
+                                            )
+                                            .selectable(true),
                                         ),
                                 ),
                         )
@@ -2620,7 +2670,8 @@ impl NotesApp {
                                 .max_w(content_width)
                                 .mx_auto()
                                 .child(
-                                    TextView::markdown("preview-only", text).selectable(true),
+                                    TextView::markdown("preview-only", preview_source(&text))
+                                        .selectable(true),
                                 ),
                         )
                         .into_any_element(),
@@ -2794,6 +2845,62 @@ fn first_line(text: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_string()
+}
+
+/// 预览前把段落内的换行变成硬换行，让「回车」在渲染结果里也换行。
+///
+/// CommonMark 只认行尾两个空格或反斜杠为硬换行，段落里的单个换行会被折叠成
+/// 空格。这里给需要保留的换行补上两个空格，代码块、表格和空行保持原样。
+fn preview_source(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 8);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut fence: Option<&'static str> = None;
+
+    for (ix, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        // 围栏代码块内部原样保留，只跟踪开合
+        if let Some(marker) = fence {
+            if trimmed.starts_with(marker) {
+                fence = None;
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if let Some(marker) = ["```", "~~~"].into_iter().find(|m| trimmed.starts_with(m)) {
+            fence = Some(marker);
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        // 下一行还有内容才算段落内的换行，空行已经能分隔段落
+        let continues = lines
+            .get(ix + 1)
+            .is_some_and(|next| !next.trim().is_empty());
+        // 表格行、分隔线、HTML 块这类结构行不加行尾空格，免得影响块解析
+        let structural = trimmed.contains('|')
+            || trimmed.starts_with('<')
+            || line
+                .trim()
+                .chars()
+                .all(|c| matches!(c, '-' | '=' | '_' | '*'));
+        // 反斜杠本身就是硬换行，不用再补空格
+        let needs_break =
+            continues && !line.trim().is_empty() && !structural && !line.ends_with('\\');
+
+        out.push_str(line);
+        if needs_break {
+            out.push_str("  ");
+        }
+        out.push('\n');
+    }
+
+    // lines() 会吞掉结尾的换行，原文不是以换行结尾时把多加的那个去掉
+    if !text.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 /// 按扩展名挑图标

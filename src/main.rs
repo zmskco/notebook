@@ -47,9 +47,14 @@ actions!(
 const NOTES_DIR: &str = "notes";
 
 fn main() {
-    let root = std::env::current_dir()
+    // 优先回到上次的工作区；目录已不存在时退回运行目录下的 notes/
+    let default_root = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(NOTES_DIR);
+    let root = fs_ops::load_session()
+        .and_then(|session| session.root)
+        .filter(|root| root.is_dir())
+        .unwrap_or(default_root);
     let _ = std::fs::create_dir_all(&root);
 
     application()

@@ -185,3 +185,62 @@ pub fn reveal_in_explorer(path: &Path) {
         let _ = std::process::Command::new("xdg-open").arg(target).spawn();
     }
 }
+
+/// 上次退出时的会话：工作区、打开的文档、当前标签
+pub struct Session {
+    pub root: Option<PathBuf>,
+    pub files: Vec<PathBuf>,
+    pub active: Option<usize>,
+}
+
+/// 会话文件位置：Windows 用 %APPDATA%\notebook\session.txt
+fn session_path() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)?;
+    Some(base.join("notebook").join("session.txt"))
+}
+
+/// 读取上次会话；没有记录或读取失败时返回 None
+pub fn load_session() -> Option<Session> {
+    let text = std::fs::read_to_string(session_path()?).ok()?;
+    let mut session = Session {
+        root: None,
+        files: Vec::new(),
+        active: None,
+    };
+
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("root=") {
+            if !value.is_empty() {
+                session.root = Some(PathBuf::from(value));
+            }
+        } else if let Some(value) = line.strip_prefix("file=") {
+            if !value.is_empty() {
+                session.files.push(PathBuf::from(value));
+            }
+        } else if let Some(value) = line.strip_prefix("active=") {
+            session.active = value.parse().ok();
+        }
+    }
+    Some(session)
+}
+
+/// 写入当前会话；失败时静默忽略，记住状态不应该影响正常使用
+pub fn save_session(root: &Path, files: &[PathBuf], active: Option<usize>) {
+    let Some(path) = session_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+
+    let mut text = format!("root={}\n", root.display());
+    for file in files {
+        text.push_str(&format!("file={}\n", file.display()));
+    }
+    if let Some(active) = active {
+        text.push_str(&format!("active={active}\n"));
+    }
+    let _ = std::fs::write(path, text);
+}
