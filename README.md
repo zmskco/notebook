@@ -4,6 +4,12 @@
 
 一个类似 VS Code 的本地 Markdown 笔记本，使用 Rust + GPUI 编写。所有笔记都是普通的 `.md` 文件，保存在工作区目录里，不联网、不上传。
 
+# 预览
+
+![雅致](./assets/images/notebook1.png)
+
+![雅致](./assets/images/notebook2.png)
+
 ## 功能
 
 ### 工作区与资源管理器
