@@ -94,6 +94,44 @@ pub fn next_folder_name(parent: &Path) -> String {
     }
 }
 
+/// 内联新建时占位行的 id。带 NUL，保证不会和真实路径重名
+pub fn placeholder_id(parent: &Path) -> String {
+    format!("{}\u{0}new", parent.to_string_lossy())
+}
+
+/// 把内联新建的占位行放到 `parent` 的子项最前面，输入框就画在该目录里。
+/// 根目录本身不是树里的节点，直接放到最顶层。
+pub fn insert_placeholder(items: &mut Vec<TreeItem>, root: &Path, parent: &Path, label: &str) {
+    let placeholder = TreeItem::new(placeholder_id(parent), label);
+    if parent == root {
+        items.insert(0, placeholder);
+        return;
+    }
+
+    let parent_id = parent.to_string_lossy().to_string();
+
+    fn walk(items: &mut Vec<TreeItem>, parent_id: &str, placeholder: &TreeItem) -> bool {
+        for item in items.iter_mut() {
+            if &*item.id == parent_id {
+                let mut node = item.clone().expanded(true);
+                node.children.insert(0, placeholder.clone());
+                *item = node;
+                return true;
+            }
+            if walk(&mut item.children, parent_id, placeholder) {
+                // 里面的目录展开了，父目录也得展开才看得见占位行
+                if !item.is_expanded() {
+                    *item = item.clone().expanded(true);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    walk(items, &parent_id, &placeholder);
+}
+
 /// 欢迎文档：首次运行或切换到空工作区时自动创建并打开
 pub const WELCOME_NAME: &str = "欢迎.md";
 

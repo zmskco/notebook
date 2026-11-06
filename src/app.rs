@@ -29,15 +29,41 @@ use crate::fs_ops;
 use crate::git;
 use crate::search;
 use crate::{
-    CloseTab, DeleteSelected, FocusFind, FocusSearch, NextTab, OpenReplace, PrevTab, Refresh,
-    RenameSelected, Save, TogglePreview,
+    CloseTab, DeleteSelected, FocusFind, FocusSearch, InlineCancel, InlineCommit, NextTab,
+    OpenReplace, PrevTab, Refresh, RenameSelected, Save, TogglePreview,
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InlineKind {
+    NewFile,
+    NewFolder,
+    Rename,
+}
+
+/// 目录树里的内联输入：新建文件和文件夹、重命名都用它在目标位置直接改名，不弹窗
+struct InlineEdit {
+    kind: InlineKind,
+    /// 新建时的父目录；重命名时的原路径
+    target: PathBuf,
+    input: Entity<InputState>,
+}
+
+impl InlineEdit {
+    /// 输入框所在的树行 id：新建时是占位行，重命名时是原路径
+    fn row_id(&self) -> String {
+        match self.kind {
+            InlineKind::Rename => self.target.to_string_lossy().to_string(),
+            _ => fs_ops::placeholder_id(&self.target),
+        }
+    }
+}
+
+/// 渲染树行时用到的内联输入快照
 #[derive(Clone)]
-enum PromptOp {
-    NewFile { parent: PathBuf },
-    NewFolder { parent: PathBuf },
-    Rename { path: PathBuf },
+struct InlineRow {
+    id: SharedString,
+    kind: InlineKind,
+    input: Entity<InputState>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -101,6 +127,13 @@ impl ColumnWidth {
 
 /// 分屏中线的拖拽载荷
 struct SplitDrag;
+
+/// 侧栏与编辑区之间分隔条的拖拽载荷
+struct SidebarDrag;
+
+/// 侧栏宽度的下限和上限，避免把目录树或编辑区挤没
+const MIN_SIDEBAR: f32 = 180.;
+const MAX_SIDEBAR: f32 = 560.;
 
 /// 源代码管理里「改动 / 历史」分隔条的拖拽载荷
 struct HistoryDrag;
@@ -353,7 +386,8 @@ pub struct NotesApp {
     expanded: HashSet<String>,
     tabs: Vec<Tab>,
     active: Option<usize>,
-    prompt_op: Option<PromptOp>,
+    /// 目录树里的内联输入（新建 / 重命名），None 表示没有
+    inline: Option<InlineEdit>,
     status: SharedString,
     sidebar: SidebarView,
     show_branches: bool,
@@ -366,6 +400,8 @@ pub struct NotesApp {
     column_width: ColumnWidth,
     /// 分屏时左栏（源码）所占比例
     split_ratio: f32,
+    /// 侧栏宽度，可拖拽调整
+    sidebar_width: f32,
     /// 源代码管理里历史提交面板的高度
     history_height: f32,
     /// 切换工作区后待打开的文档：创建编辑器需要 Window，留到渲染时打开
@@ -408,7 +444,7 @@ impl NotesApp {
             expanded,
             tabs: Vec::new(),
             active: None,
-            prompt_op: None,
+            inline: None,
             status: "".into(),
             sidebar: SidebarView::Explorer,
             show_branches: false,
@@ -446,6 +482,7 @@ impl NotesApp {
             theme_choice: ThemeChoice::Elegant,
             column_width: ColumnWidth::Standard,
             split_ratio: 0.5,
+            sidebar_width: 272.,
             history_height: DEFAULT_HISTORY,
             pending_open: None,
             wenkai_family,
@@ -920,10 +957,27 @@ impl NotesApp {
         if let Some(path) = self.active_doc().map(|d| d.path.clone()) {
             self.reveal_parent(&path);
         }
+        // set_items 会清空选中项，先记下，重建后选回去
+        let selected = self
+            .tree_state
+            .read(cx)
+            .selected_item()
+            .map(|item| item.id.clone());
         let root = self.root.clone();
         let expanded = self.expanded.clone();
+        let mut items = fs_ops::build_items(&root, &expanded);
+        // 内联新建时给目标目录插一行占位，输入框就画在那一行
+        if let Some(edit) = self.inline.as_ref() {
+            if edit.kind != InlineKind::Rename {
+                fs_ops::insert_placeholder(&mut items, &root, &edit.target, "新名称");
+            }
+        }
         self.tree_state.update(cx, |state, cx| {
-            state.set_items(fs_ops::build_items(&root, &expanded), cx);
+            state.set_items(items, cx);
+            if let Some(id) = selected.as_ref() {
+                let ix = state.index_of(id);
+                state.set_selected_index(ix, cx);
+            }
         });
     }
 
@@ -944,128 +998,114 @@ impl NotesApp {
             .map(|item| PathBuf::from(item.id.to_string()))
     }
 
-    // ---------- 新建 / 重命名（弹窗输入名称） ----------
+    // ---------- 新建 / 重命名（目录树内联输入） ----------
 
-    fn prompt(&mut self, op: PromptOp, window: &mut Window, cx: &mut Context<Self>) {
-        let (title, initial): (SharedString, String) = match &op {
-            PromptOp::NewFile { parent } => ("新建文件".into(), fs_ops::next_untitled(parent)),
-            PromptOp::NewFolder { parent } => {
-                ("新建文件夹".into(), fs_ops::next_folder_name(parent))
-            }
-            PromptOp::Rename { path } => (
-                "重命名".into(),
-                path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-            ),
+    /// 在目录树里就地输入名字。新建时 `target` 是父目录，重命名时是要改的路径
+    fn start_inline(
+        &mut self,
+        kind: InlineKind,
+        target: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let initial = match kind {
+            InlineKind::NewFile => fs_ops::next_untitled(&target),
+            InlineKind::NewFolder => fs_ops::next_folder_name(&target),
+            InlineKind::Rename => target
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
         };
 
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(initial.clone()));
-        let view = cx.entity();
-        let input_handle = input.clone();
-        let input_for_focus = input.clone();
-        self.prompt_op = Some(op);
+        // 新建的输入框画在目标目录里，目录要展开才看得见
+        if kind != InlineKind::Rename {
+            self.reveal_parent(&target.join("x"));
+        }
 
-        // 对话框打开时会把焦点交给外壳，这里在首次构建时把焦点还给输入框
-        let initial_focus = std::cell::Cell::new(true);
-        window.open_dialog(cx, move |dialog, window, cx| {
-            if initial_focus.replace(false) {
-                let handle = input_for_focus.read(cx).focus_handle(cx);
-                handle.focus(window, cx);
-                // 全选默认名，直接输入即可替换
-                input_for_focus.update(cx, |state, cx| state.select_all(window, cx));
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(initial));
+        // 点到别处就算放弃；重名等提示会重新聚焦，不会被这里当成失焦
+        cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Blur)
+                && this
+                    .inline
+                    .as_ref()
+                    .is_some_and(|edit| edit.input == input)
+            {
+                this.cancel_inline(cx);
             }
-            let view = view.clone();
-            let input = input_handle.clone();
-            dialog
-                .title(title.clone())
-                .child(Input::new(&input))
-                .footer(
-                    DialogFooter::new()
-                        .child(
-                            Button::new("cancel")
-                                .label("取消")
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
-                        )
-                        .child(
-                            DialogAction::new().child(Button::new("ok").primary().label("确定")),
-                        ),
-                )
-                .on_ok(move |_, window, cx| {
-                    let name = input.read(cx).value().trim().to_string();
-                    if !fs_ops::is_valid_name(&name) {
-                        let view = view.clone();
-                        view.update(cx, |this, cx| {
-                            this.set_status("名称不能为空，且不能包含 \\ / : * ? \" < > |", cx)
-                        });
-                        return false;
-                    }
-                    let view = view.clone();
-                    view.update(cx, |this, cx| this.apply_prompt(name, window, cx))
-                })
+        })
+        .detach();
+        self.inline = Some(InlineEdit {
+            kind,
+            target,
+            input: input.clone(),
         });
+        self.rescan(cx);
+
+        let handle = input.read(cx).focus_handle(cx).clone();
+        handle.focus(window, cx);
+        // 全选默认名，直接输入即可替换
+        input.update(cx, |state, cx| state.select_all(window, cx));
+        self.set_status("输入名称，回车确认，Esc 取消", cx);
     }
 
-    /// 执行弹窗操作，返回 true 表示关闭弹窗
-    fn apply_prompt(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(op) = self.prompt_op.clone() else {
-            return false;
+    /// 内联输入的回车：落盘并收起输入框；名字不合法或有冲突时留在原地提示
+    fn commit_inline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.inline.take() else {
+            return;
         };
-        let ok = match op {
-            PromptOp::NewFile { parent } => {
+        let name = edit.input.read(cx).value().trim().to_string();
+        if !fs_ops::is_valid_name(&name) {
+            self.keep_inline(
+                edit,
+                "名称不能为空，且不能包含 \\ / : * ? \" < > |",
+                window,
+                cx,
+            );
+            return;
+        }
+
+        match edit.kind {
+            InlineKind::NewFile => {
                 let mut file_name = name;
                 if Path::new(&file_name).extension().is_none() {
                     file_name.push_str(".md");
                 }
-                let path = parent.join(&file_name);
+                let path = edit.target.join(&file_name);
                 if path.exists() {
-                    self.set_status(format!("“{file_name}”已存在"), cx);
-                    false
-                } else {
-                    match std::fs::write(&path, "") {
-                        Ok(_) => {
-                            self.expanded
-                                .insert(parent.to_string_lossy().to_string());
-                            self.rescan(cx);
-                            self.set_status(format!("已创建 {file_name}"), cx);
-                            self.open_file(path, window, cx);
-                            true
-                        }
-                        Err(err) => {
-                            self.set_status(format!("创建失败：{err}"), cx);
-                            false
-                        }
-                    }
+                    self.keep_inline(edit, format!("“{file_name}”已存在"), window, cx);
+                    return;
                 }
+                if let Err(err) = std::fs::write(&path, "") {
+                    self.keep_inline(edit, format!("创建失败：{err}"), window, cx);
+                    return;
+                }
+                self.set_status(format!("已创建 {file_name}"), cx);
+                self.rescan(cx);
+                // 打开文件要 Window，留到下一次渲染
+                self.pending_open = Some(path);
             }
-            PromptOp::NewFolder { parent } => {
-                let path = parent.join(&name);
+            InlineKind::NewFolder => {
+                let path = edit.target.join(&name);
                 if path.exists() {
-                    self.set_status(format!("“{name}”已存在"), cx);
-                    false
-                } else {
-                    match std::fs::create_dir_all(&path) {
-                        Ok(_) => {
-                            self.expanded
-                                .insert(parent.to_string_lossy().to_string());
-                            self.rescan(cx);
-                            // 选中刚建好的目录，便于继续在里面新建内容
-                            let id = SharedString::from(path.to_string_lossy().to_string());
-                            self.tree_state.update(cx, |state, cx| {
-                                let ix = state.index_of(&id);
-                                state.set_selected_index(ix, cx);
-                            });
-                            self.set_status(format!("已创建文件夹 {name}"), cx);
-                            true
-                        }
-                        Err(err) => {
-                            self.set_status(format!("创建失败：{err}"), cx);
-                            false
-                        }
-                    }
+                    self.keep_inline(edit, format!("“{name}”已存在"), window, cx);
+                    return;
                 }
+                if let Err(err) = std::fs::create_dir_all(&path) {
+                    self.keep_inline(edit, format!("创建失败：{err}"), window, cx);
+                    return;
+                }
+                self.set_status(format!("已创建文件夹 {name}"), cx);
+                self.rescan(cx);
+                // 选中刚建好的目录，便于继续在里面新建内容
+                let id = SharedString::from(path.to_string_lossy().to_string());
+                self.tree_state.update(cx, |state, cx| {
+                    let ix = state.index_of(&id);
+                    state.set_selected_index(ix, cx);
+                });
             }
-            PromptOp::Rename { path } => {
+            InlineKind::Rename => {
+                let path = edit.target.clone();
                 let mut new_name = name;
                 // 重命名文件时若没写扩展名，保留原扩展名
                 if path.is_file() && Path::new(&new_name).extension().is_none() {
@@ -1075,32 +1115,48 @@ impl NotesApp {
                     }
                 }
                 let new_path = path.with_file_name(&new_name);
-                if new_path == path {
-                    true
-                } else if new_path.exists() {
-                    self.set_status(format!("“{new_name}”已存在"), cx);
-                    false
-                } else {
-                    match std::fs::rename(&path, &new_path) {
-                        Ok(_) => {
-                            self.remap_paths(&path, &new_path);
-                            self.rescan(cx);
-                            self.set_status("已重命名", cx);
-                            true
-                        }
-                        Err(err) => {
-                            self.set_status(format!("重命名失败：{err}"), cx);
-                            false
-                        }
+                if new_path != path {
+                    if new_path.exists() {
+                        self.keep_inline(edit, format!("“{new_name}”已存在"), window, cx);
+                        return;
                     }
+                    if let Err(err) = std::fs::rename(&path, &new_path) {
+                        self.keep_inline(edit, format!("重命名失败：{err}"), window, cx);
+                        return;
+                    }
+                    self.remap_paths(&path, &new_path);
+                    self.set_status("已重命名", cx);
                 }
+                self.rescan(cx);
             }
-        };
-        if ok {
-            self.prompt_op = None;
-            self.refresh_git(cx);
         }
-        ok
+
+        self.refresh_git(cx);
+        cx.notify();
+    }
+
+    /// 提交失败：把输入框放回去，并重新选中原来的名字
+    fn keep_inline(
+        &mut self,
+        edit: InlineEdit,
+        message: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = edit.input.clone();
+        self.inline = Some(edit);
+        self.set_status(message, cx);
+        let handle = input.read(cx).focus_handle(cx).clone();
+        handle.focus(window, cx);
+        input.update(cx, |state, cx| state.select_all(window, cx));
+    }
+
+    /// Esc 或点到别处：放弃输入，占位行随之消失
+    fn cancel_inline(&mut self, cx: &mut Context<Self>) {
+        if self.inline.take().is_some() {
+            self.rescan(cx);
+            cx.notify();
+        }
     }
 
     /// 重命名目录后，同步展开状态和已打开标签的路径
@@ -1215,7 +1271,7 @@ impl NotesApp {
 
     fn on_rename_selected(&mut self, _: &RenameSelected, window: &mut Window, cx: &mut Context<Self>) {
         match self.selected_path(cx) {
-            Some(path) => self.prompt(PromptOp::Rename { path }, window, cx),
+            Some(path) => self.start_inline(InlineKind::Rename, path, window, cx),
             None => self.set_status("先在左侧选中一个文件或文件夹", cx),
         }
     }
@@ -2008,11 +2064,9 @@ impl NotesApp {
         };
 
         v_flex()
-            .w(px(272.))
+            .w(px(self.sidebar_width))
             .h_full()
             .flex_shrink_0()
-            .border_r_1()
-            .border_color(border)
             .child(
                 h_flex()
                     .px_1p5()
@@ -2117,10 +2171,15 @@ impl NotesApp {
         let tree_state = self.tree_state.clone();
 
         let selected = self.selected_path(cx);
-        let target = selected
-            .clone()
-            .filter(|path| path.is_dir())
-            .unwrap_or_else(|| root.clone());
+        // 与右键菜单一致：选中目录就在目录里新建，选中文件就在它旁边新建
+        let target = match selected.clone() {
+            Some(path) if path.is_dir() => path,
+            Some(path) => path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| root.clone()),
+            None => root.clone(),
+        };
 
         // 已打开且有未保存改动的文件，用于在树上打点
         let dirty_paths: HashSet<String> = self
@@ -2135,14 +2194,72 @@ impl NotesApp {
         let focus_state = self.tree_state.clone();
         let menu_tree = self.tree_state.clone();
         let tree_icons = self.icons.clone();
+        let expanded_now = self.expanded.clone();
+        // 内联输入所在的行（新建的占位行或正在重命名的行）
+        let inline_row = self.inline.as_ref().map(|edit| InlineRow {
+            id: SharedString::from(edit.row_id()),
+            kind: edit.kind,
+            input: edit.input.clone(),
+        });
         let tree_element = tree(&tree_state, move |ix, entry, _selected, _window, _cx| {
             let id = entry.item().id.to_string();
+
+            if let Some(inline) = inline_row.as_ref().filter(|row| &*row.id == id) {
+                let icon = match inline.kind {
+                    InlineKind::NewFolder => tree_icons.folder(true),
+                    InlineKind::Rename => {
+                        let path = PathBuf::from(&id);
+                        if path.is_dir() {
+                            tree_icons.folder(entry.is_folder() && entry.is_expanded())
+                        } else {
+                            tree_icons.file(&path)
+                        }
+                    }
+                    InlineKind::NewFile => tree_icons.file(Path::new("笔记.md")),
+                };
+                let commit_view = tree_view.clone();
+                let cancel_view = tree_view.clone();
+                return ListItem::new(ix)
+                    .pl(px(entry.depth() as f32 * 14. + 8.))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .items_center()
+                            // 输入框里的点击 / 键盘不要冒泡成树行的选中、展开和回车
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .id("tree-inline-edit")
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .key_context("InlineEdit")
+                            .on_action(move |_: &InlineCommit, window, cx| {
+                                commit_view.update(cx, |this, cx| this.commit_inline(window, cx))
+                            })
+                            .on_action(move |_: &InlineCancel, _window, cx| {
+                                cancel_view.update(cx, |this, cx| this.cancel_inline(cx))
+                            })
+                            .child(icon)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Input::new(&inline.input).small()),
+                            ),
+                    );
+            }
+
             let path = PathBuf::from(&id);
-            let is_folder = entry.is_folder();
+            // 空文件夹没有子项，树会把它当叶子，这里再问一下磁盘
+            let is_folder = entry.is_folder() || path.is_dir();
+            // 空文件夹在树里是叶子，没有展开状态，用自己记的那份让它也能切换图标
+            let expanded = if entry.is_folder() {
+                entry.is_expanded()
+            } else {
+                expanded_now.contains(&id)
+            };
             let opened = !is_folder && open_dirty.contains(&id);
 
             let icon = if is_folder {
-                tree_icons.folder(entry.is_expanded())
+                tree_icons.folder(expanded)
             } else {
                 tree_icons.file(&path)
             };
@@ -2170,12 +2287,21 @@ impl NotesApp {
             let click_view = tree_view.clone();
             let click_path = path.clone();
             let click_state = focus_state.clone();
+            // 空文件夹在树里是叶子，点击时自己切换展开状态，让图标有开合反馈
+            let click_empty_folder = is_folder && !entry.is_folder();
+            let click_id = id.clone();
             item = item.on_click(move |_, window, cx| {
                 // 点击文件夹时把焦点交给目录树，方便继续用 F2 / Delete
                 if is_folder {
                     click_state.update(cx, |state, cx| state.focus(window, cx));
                 }
                 click_view.update(cx, |this, cx| {
+                    if click_empty_folder {
+                        if !this.expanded.remove(&click_id) {
+                            this.expanded.insert(click_id.clone());
+                        }
+                        cx.notify();
+                    }
                     this.open_file(click_path.clone(), window, cx)
                 });
             });
@@ -2207,13 +2333,7 @@ impl NotesApp {
                         let parent = parent.clone();
                         move |_, window, cx| {
                             view.update(cx, |this, cx| {
-                                this.prompt(
-                                    PromptOp::NewFile {
-                                        parent: parent.clone(),
-                                    },
-                                    window,
-                                    cx,
-                                )
+                                this.start_inline(InlineKind::NewFile, parent.clone(), window, cx)
                             })
                         }
                     }),
@@ -2226,13 +2346,7 @@ impl NotesApp {
                         let parent = parent.clone();
                         move |_, window, cx| {
                             view.update(cx, |this, cx| {
-                                this.prompt(
-                                    PromptOp::NewFolder {
-                                        parent: parent.clone(),
-                                    },
-                                    window,
-                                    cx,
-                                )
+                                this.start_inline(InlineKind::NewFolder, parent.clone(), window, cx)
                             })
                         }
                     }),
@@ -2247,7 +2361,7 @@ impl NotesApp {
                         let path = path.clone();
                         move |_, window, cx| {
                             view.update(cx, |this, cx| {
-                                this.prompt(PromptOp::Rename { path: path.clone() }, window, cx)
+                                this.start_inline(InlineKind::Rename, path.clone(), window, cx)
                             })
                         }
                     }),
@@ -2308,10 +2422,9 @@ impl NotesApp {
                                         let target = target.clone();
                                         move |_, window, cx| {
                                             view.update(cx, |this, cx| {
-                                                this.prompt(
-                                                    PromptOp::NewFile {
-                                                        parent: target.clone(),
-                                                    },
+                                                this.start_inline(
+                                                    InlineKind::NewFile,
+                                                    target.clone(),
                                                     window,
                                                     cx,
                                                 )
@@ -2330,10 +2443,9 @@ impl NotesApp {
                                         let target = target.clone();
                                         move |_, window, cx| {
                                             view.update(cx, |this, cx| {
-                                                this.prompt(
-                                                    PromptOp::NewFolder {
-                                                        parent: target.clone(),
-                                                    },
+                                                this.start_inline(
+                                                    InlineKind::NewFolder,
+                                                    target.clone(),
                                                     window,
                                                     cx,
                                                 )
@@ -2414,10 +2526,9 @@ impl NotesApp {
                                     let root = blank_root.clone();
                                     move |_, window, cx| {
                                         view.update(cx, |this, cx| {
-                                            this.prompt(
-                                                PromptOp::NewFile {
-                                                    parent: root.clone(),
-                                                },
+                                            this.start_inline(
+                                                InlineKind::NewFile,
+                                                root.clone(),
                                                 window,
                                                 cx,
                                             )
@@ -2433,10 +2544,9 @@ impl NotesApp {
                                     let root = blank_root.clone();
                                     move |_, window, cx| {
                                         view.update(cx, |this, cx| {
-                                            this.prompt(
-                                                PromptOp::NewFolder {
-                                                    parent: root.clone(),
-                                                },
+                                            this.start_inline(
+                                                InlineKind::NewFolder,
+                                                root.clone(),
                                                 window,
                                                 cx,
                                             )
@@ -3823,13 +3933,7 @@ impl NotesApp {
                             let root = root.clone();
                             move |_, window, cx| {
                                 view.update(cx, |this, cx| {
-                                    this.prompt(
-                                        PromptOp::NewFile {
-                                            parent: root.clone(),
-                                        },
-                                        window,
-                                        cx,
-                                    )
+                                    this.start_inline(InlineKind::NewFile, root.clone(), window, cx)
                                 })
                             }
                         }),
@@ -3914,6 +4018,7 @@ impl Render for NotesApp {
 
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
+        let border = cx.theme().border;
 
         v_flex()
             .size_full()
@@ -3948,7 +4053,27 @@ impl Render for NotesApp {
                     .flex_1()
                     .min_h_0()
                     .w_full()
+                    .on_drag_move(cx.listener(
+                        |this, event: &DragMoveEvent<SidebarDrag>, _, cx| {
+                            let x = f32::from(event.event.position.x - event.bounds.origin.x);
+                            let width = x.clamp(MIN_SIDEBAR, MAX_SIDEBAR);
+                            if (this.sidebar_width - width).abs() > 0.5 {
+                                this.sidebar_width = width;
+                                cx.notify();
+                            }
+                        },
+                    ))
                     .child(self.render_sidebar(cx))
+                    .child(
+                        div()
+                            .id("sidebar-divider")
+                            .w(px(4.))
+                            .h_full()
+                            .flex_shrink_0()
+                            .bg(border)
+                            .cursor(CursorStyle::ResizeLeftRight)
+                            .on_drag(SidebarDrag, |_, _, _, cx| cx.new(|_| SplitGhost)),
+                    )
                     .child(self.render_main(window, cx)),
             )
             .child(self.render_status_bar(cx))

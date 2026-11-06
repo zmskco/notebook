@@ -49,6 +49,8 @@ actions!(
         FocusSearch,
         FocusFind,
         OpenReplace,
+        InlineCommit,
+        InlineCancel,
     ]
 );
 
@@ -83,6 +85,9 @@ fn main() {
                 // 只有焦点在目录树上时才生效，避免误删编辑器内容
                 KeyBinding::new("f2", RenameSelected, Some("Tree")),
                 KeyBinding::new("delete", DeleteSelected, Some("Tree")),
+                // 目录树内联输入名字时：回车确认、Esc 取消
+                KeyBinding::new("enter", InlineCommit, Some("InlineEdit")),
+                KeyBinding::new("escape", InlineCancel, Some("InlineEdit")),
             ]);
 
             // 默认窗口 1320×880，由 gpui 按显示器工作区居中并收敛
