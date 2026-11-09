@@ -4,8 +4,9 @@ version = "0.6.0"
 edition = "2024"
 
 [dependencies]
-gpui-kit = "0.8.1"
+gpui-kit = { version = "0.8.1", features = ["tree-sitter-languages"] }
 gpui-kit-markdown-editor = { version = "0.1.2", default-features = false }
+serde_json = "1"
 
 [build-dependencies]
 embed-resource = "3.0.12"

@@ -28,6 +28,7 @@ mod file_icons;
 mod fs_ops;
 mod git;
 mod search;
+mod syntax;
 
 use std::path::PathBuf;
 

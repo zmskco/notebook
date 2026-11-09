@@ -620,6 +620,8 @@ impl NotesApp {
             colors.button_foreground = rgb(palette.foreground).into();
             // ghost 按钮的 selected 态取 secondary_active，工具栏的字体/字号/背景/宽度按钮全靠它
             colors.secondary_active = rgba(selection).into();
+            // 代码块语法高亮：深色用 Dracula，浅色用官方的浅色变体 Alucard
+            theme.highlight_theme = crate::syntax::highlight_theme(dark);
         });
         cx.notify();
     }
