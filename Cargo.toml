@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 gpui-kit = { version = "0.8.1", features = ["tree-sitter-languages"] }
-gpui-kit-markdown-editor = { version = "0.1.2", default-features = false }
+gpui-kit-markdown-editor = { path = "vendor/gpui-kit-markdown-editor" }
 serde_json = "1"
 
 [build-dependencies]

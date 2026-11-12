@@ -274,6 +274,8 @@ impl ThemeChoice {
 /// 打开中的文本文件
 struct Doc {
     path: PathBuf,
+    /// 临时文件：还没有落到磁盘上，保存时要先让用户选目录
+    untitled: bool,
     /// 源码编辑器：分屏视图使用，也是切到演示前的文本来源
     editor: Entity<EditorState>,
     /// 所见即所得编辑器：编辑视图使用
@@ -326,6 +328,11 @@ impl Tab {
             Tab::File(doc) => doc.is_dirty(cx),
             Tab::Diff { .. } => false,
         }
+    }
+
+    /// 是否是还没写到磁盘上的临时文件
+    fn untitled(&self) -> bool {
+        matches!(self, Tab::File(doc) if doc.untitled)
     }
 
     /// 标签只显示文件名，目录层级由左侧资源管理器体现
@@ -406,6 +413,8 @@ pub struct NotesApp {
     history_height: f32,
     /// 切换工作区后待打开的文档：创建编辑器需要 Window，留到渲染时打开
     pending_open: Option<PathBuf>,
+    /// 临时文件存盘后要关闭的标签（选目录是异步的，等下次渲染再关）
+    pending_close: Option<PathBuf>,
     wenkai_family: SharedString,
     puhuiti_family: SharedString,
     /// 目录树与标签栏使用的彩色文件图标
@@ -485,6 +494,7 @@ impl NotesApp {
             sidebar_width: 272.,
             history_height: DEFAULT_HISTORY,
             pending_open: None,
+            pending_close: None,
             wenkai_family,
             puhuiti_family,
             icons,
@@ -549,6 +559,8 @@ impl NotesApp {
         let files: Vec<PathBuf> = self
             .tabs
             .iter()
+            // 临时文件还没有真实路径，不写进会话
+            .filter(|tab| !tab.untitled())
             .filter_map(|tab| tab.path().map(Path::to_path_buf))
             .collect();
         fs_ops::save_session(&self.root, &files, self.active);
@@ -673,6 +685,35 @@ impl NotesApp {
         (editor, scroll)
     }
 
+    /// 组一个标签页：源码编辑器、所见即所得编辑器、演示视图一应俱全。
+    /// `untitled` 为 true 时表示临时文件，`path` 只是占位地址，不会写盘
+    fn make_doc(
+        path: PathBuf,
+        untitled: bool,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Doc {
+        let editor = Self::make_editor(text, window, cx);
+        let (wysiwyg, wys_scroll) = Self::make_block_editor(text, window, cx);
+        let preview_src = preview_source(text);
+        let preview = cx.new(|cx| TextViewState::markdown(&preview_src, cx));
+        // 所见即所得重新序列化后会得到规范形式，与原文格式未必一致，
+        // 以它当基线，打开文件不会立刻被当成改动
+        let baseline = wysiwyg.read(cx).source();
+        Doc {
+            path,
+            untitled,
+            editor,
+            wysiwyg,
+            wys_scroll,
+            preview,
+            preview_src,
+            baseline,
+            view: ViewMode::Edit,
+        }
+    }
+
     fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if path.is_dir() {
             return;
@@ -688,23 +729,8 @@ impl NotesApp {
 
         match std::fs::read_to_string(&path) {
             Ok(text) => {
-                let editor = Self::make_editor(&text, window, cx);
-                let (wysiwyg, wys_scroll) = Self::make_block_editor(&text, window, cx);
-                let preview_src = preview_source(&text);
-                let preview = cx.new(|cx| TextViewState::markdown(&preview_src, cx));
-                // 所见即所得重新序列化后会得到规范形式，与原文格式未必一致，
-                // 以它当基线，打开文件不会立刻被当成改动
-                let baseline = wysiwyg.read(cx).source();
-                self.tabs.push(Tab::File(Doc {
-                    path: path.clone(),
-                    editor,
-                    wysiwyg,
-                    wys_scroll,
-                    preview,
-                    preview_src,
-                    baseline,
-                    view: ViewMode::Edit,
-                }));
+                let doc = Self::make_doc(path.clone(), false, &text, window, cx);
+                self.tabs.push(Tab::File(doc));
                 self.active = Some(self.tabs.len() - 1);
                 self.reveal_parent(&path);
                 self.rescan(cx);
@@ -794,6 +820,10 @@ impl NotesApp {
         let Some(Tab::File(doc)) = self.tabs.get_mut(ix) else {
             return false;
         };
+        // 临时文件还没有落盘位置，得走「存为」流程让用户先选目录
+        if doc.untitled {
+            return false;
+        }
         // 没有真正编辑过就不写盘，避免把文件整体重排成另一种写法
         if !doc.is_dirty(cx) {
             return true;
@@ -821,8 +851,13 @@ impl NotesApp {
     }
 
     fn on_save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active.is_none() {
+        let Some(ix) = self.active else {
             self.set_status("还没有打开笔记", cx);
+            return;
+        };
+        // 临时文件还没有落盘位置，先让用户另存为
+        if self.tabs[ix].untitled() {
+            self.prompt_save_untitled(ix, false, cx);
             return;
         }
         if self.save_active(cx) {
@@ -830,6 +865,153 @@ impl NotesApp {
         }
         self.refresh_git(cx);
         let _ = window;
+    }
+
+    // ---------- 临时文件 ----------
+
+    /// 临时文件的占位路径：工作区里的「未命名.md」「未命名 2.md」……
+    /// 只用来显示标题和图标，不落盘；与已有标签或真实文件重名时自动往后排
+    fn untitled_path(&self) -> PathBuf {
+        let mut n = 1;
+        loop {
+            let name = if n == 1 {
+                "未命名.md".to_string()
+            } else {
+                format!("未命名 {n}.md")
+            };
+            let path = self.root.join(name);
+            let taken = self
+                .tabs
+                .iter()
+                .any(|tab| tab.path() == Some(path.as_path()));
+            if !taken && !path.exists() {
+                return path;
+            }
+            n += 1;
+        }
+    }
+
+    /// 开一个临时文件：不落盘，保存时再选目录
+    fn new_untitled_doc(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.untitled_path();
+        let doc = Self::make_doc(path, true, "", window, cx);
+        self.tabs.push(Tab::File(doc));
+        self.active = Some(self.tabs.len() - 1);
+        self.focus_active(window, cx);
+        self.set_status("临时文件：按 Ctrl+S 选择保存位置", cx);
+    }
+
+    /// 调系统的「另存为」对话框，文件名和目录都在同一个框里填
+    fn prompt_save_untitled(&mut self, ix: usize, close_after: bool, cx: &mut Context<Self>) {
+        if ix >= self.tabs.len() || !self.tabs[ix].untitled() {
+            return;
+        }
+        let Some(Tab::File(doc)) = self.tabs.get(ix) else {
+            return;
+        };
+        let suggested = doc
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string());
+        let directory = self.root.clone();
+        let rx = cx.prompt_for_new_path(&directory, suggested.as_deref());
+        cx.spawn(async move |this, cx| {
+            let path = match rx.await {
+                Ok(Ok(path)) => path,
+                _ => None,
+            };
+            let Some(path) = path else {
+                return; // 用户取消了
+            };
+            this.update(cx, |this, cx| this.save_untitled_to(ix, path, close_after, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// 临时文件写到用户选定的路径，标签随即变成真实文件
+    fn save_untitled_to(
+        &mut self,
+        ix: usize,
+        mut path: PathBuf,
+        close_after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Tab::File(doc)) = self.tabs.get(ix) else {
+            return;
+        };
+        if !doc.untitled {
+            return;
+        }
+        // 系统对话框不会替我们补扩展名
+        if path.extension().is_none() {
+            path.set_extension("md");
+        }
+        let text = doc.text(cx);
+        if let Err(err) = std::fs::write(&path, &text) {
+            self.set_status(format!("保存失败：{err}"), cx);
+            return;
+        }
+
+        if let Some(Tab::File(doc)) = self.tabs.get_mut(ix) {
+            doc.path = path.clone();
+            doc.untitled = false;
+            doc.baseline = text;
+        }
+        if close_after {
+            // 选目录是异步的，这里没有 Window，关标签留到下一次渲染
+            self.pending_close = Some(path.clone());
+        }
+        self.reveal_parent(&path);
+        self.rescan(cx);
+        self.persist_session();
+        self.set_status(format!("已保存到 {}", path.display()), cx);
+    }
+
+    // ---------- 全部关闭 ----------
+
+    /// 关闭所有标签；有未保存的修改时先确认
+    fn close_all_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let dirty = self.tabs.iter().filter(|tab| tab.dirty(cx)).count();
+        if dirty == 0 {
+            self.close_all_now(cx);
+            return;
+        }
+
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            dialog
+                .title("关闭全部文件")
+                .child(format!("有 {dirty} 个文件还没保存，关闭会丢失修改。"))
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("close-all-cancel")
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("close-all-confirm")
+                                .label("全部关闭")
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    view.update(cx, |this, cx| this.close_all_now(cx));
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn close_all_now(&mut self, cx: &mut Context<Self>) {
+        self.tabs.clear();
+        self.active = None;
+        self.sync_selection(cx);
+        self.persist_session();
+        self.set_status("已关闭全部文件", cx);
     }
 
     fn request_close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -867,8 +1049,13 @@ impl NotesApp {
                             move |_, window, cx| {
                                 window.close_dialog(cx);
                                 save_view.update(cx, |this, cx| {
-                                    this.save_doc(ix, cx);
-                                    this.close_tab_now(ix, window, cx);
+                                    // 临时文件要先另存为，存好后再关
+                                    if this.tabs.get(ix).is_some_and(|tab| tab.untitled()) {
+                                        this.prompt_save_untitled(ix, true, cx);
+                                    } else {
+                                        this.save_doc(ix, cx);
+                                        this.close_tab_now(ix, window, cx);
+                                    }
                                 });
                             },
                         )),
@@ -3400,7 +3587,8 @@ impl NotesApp {
                     Button::new("find-replace-one")
                         .ghost()
                         .small()
-                        .label("替换")
+                        .icon(IconName::Replace)
+                        .tooltip("替换当前")
                         .disabled(total == 0)
                         .on_click({
                             let view = view.clone();
@@ -3413,7 +3601,8 @@ impl NotesApp {
                     Button::new("find-replace-all")
                         .ghost()
                         .small()
-                        .label("全部替换")
+                        .icon(IconName::ReplaceAll)
+                        .tooltip("全部替换")
                         .disabled(total == 0)
                         .on_click({
                             let view = view.clone();
@@ -3502,11 +3691,25 @@ impl NotesApp {
                                 close_view.update(cx, |this, cx| this.request_close(ix, window, cx))
                             }),
                     )
-                    .on_click(move |_, window, cx| {
+                    .on_click(move |event: &ClickEvent, window, cx| {
+                        // 双击标签本身不算「标签条空白处」，只当切换
+                        if event.click_count() > 1 {
+                            cx.stop_propagation();
+                            return;
+                        }
                         click_view.update(cx, |this, cx| this.activate(ix, window, cx))
                     })
                     .into_any_element()
-            }));
+            }))
+            .on_click({
+                let view = view.clone();
+                move |event: &ClickEvent, window, cx| {
+                    // 双击标签条空白处：开一个临时文件
+                    if event.click_count() == 2 {
+                        view.update(cx, |this, cx| this.new_untitled_doc(window, cx));
+                    }
+                }
+            });
 
         let mode = self.active_doc().map(|doc| doc.view).unwrap_or(ViewMode::Edit);
         let dirty = self
@@ -3514,6 +3717,11 @@ impl NotesApp {
             .and_then(|ix| self.tabs.get(ix))
             .is_some_and(|tab| tab.dirty(cx));
         let is_file = self.active_doc().is_some();
+        // 临时文件即使还没改过也能保存（落盘这件事本身就有意义）
+        let untitled = self
+            .active
+            .and_then(|ix| self.tabs.get(ix))
+            .is_some_and(|tab| tab.untitled());
 
         // 排版工具栏：字体 · 字号 · 背景
         let font_family = self.font_family();
@@ -3623,7 +3831,7 @@ impl NotesApp {
                 Button::new("find-open")
                     .ghost()
                     .small()
-                    .label("查找")
+                    .icon(IconName::Search)
                     .tooltip("在本文档里查找（Ctrl+F）")
                     .selected(find_open && !find_replace)
                     .disabled(!is_file)
@@ -3651,7 +3859,7 @@ impl NotesApp {
                 Button::new("find-replace")
                     .ghost()
                     .small()
-                    .label("替换")
+                    .icon(IconName::Replace)
                     .tooltip("在本文档里替换（Ctrl+H）")
                     .selected(find_replace)
                     .disabled(!is_file)
@@ -3665,6 +3873,20 @@ impl NotesApp {
                                     this.open_find(true, window, cx);
                                 }
                             })
+                        }
+                    }),
+            )
+            .child(
+                Button::new("close-all-tabs")
+                    .ghost()
+                    .small()
+                    .icon(IconName::CircleX)
+                    .tooltip("关闭所有文件")
+                    .disabled(self.tabs.is_empty())
+                    .on_click({
+                        let view = view.clone();
+                        move |_, window, cx| {
+                            view.update(cx, |this, cx| this.close_all_tabs(window, cx))
                         }
                     }),
             );
@@ -3747,11 +3969,19 @@ impl NotesApp {
                     .small()
                     .icon(IconName::Save)
                     .tooltip("保存（Ctrl+S）")
-                    .disabled(!dirty)
+                    .disabled(!dirty && !untitled)
                     .on_click({
                         let view = view.clone();
                         move |_, _, cx| {
-                            view.update(cx, |this, cx| this.save_active(cx));
+                            view.update(cx, |this, cx| {
+                                if let Some(ix) = this.active
+                                    && this.tabs.get(ix).is_some_and(|tab| tab.untitled())
+                                {
+                                    this.prompt_save_untitled(ix, false, cx);
+                                    return;
+                                }
+                                this.save_active(cx);
+                            });
                         }
                     }),
             );
@@ -4016,6 +4246,15 @@ impl Render for NotesApp {
         // 切换工作区后新生成的欢迎文档在这里打开（创建编辑器需要 Window）
         if let Some(path) = self.pending_open.take() {
             self.open_file(path, window, cx);
+        }
+        // 临时文件保存后要关闭的标签，同样等拿到 Window 再关
+        if let Some(path) = self.pending_close.take()
+            && let Some(ix) = self
+                .tabs
+                .iter()
+                .position(|tab| tab.path() == Some(path.as_path()))
+        {
+            self.close_tab_now(ix, window, cx);
         }
 
         let background = cx.theme().background;

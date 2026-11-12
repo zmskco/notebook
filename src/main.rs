@@ -111,3 +111,55 @@ fn main() {
             .expect("打开窗口失败");
         });
 }
+
+#[cfg(test)]
+mod line_break_tests {
+    use gpui_kit::base::text::MarkdownExtensions;
+    use markdown_editor::{BlockEditorModel, BlockKind, BlockPosition, BlockSelection};
+
+    fn model(source: &str) -> BlockEditorModel {
+        BlockEditorModel::from_markdown(source, MarkdownExtensions::default()).unwrap()
+    }
+
+    #[test]
+    fn single_newline_survives_a_round_trip() {
+        let mut m = model("第一行\n第二行\n");
+        assert_eq!(m.source(), "第一行\n第二行\n\n");
+
+        let id = m.document().leaves().next().unwrap().id();
+        m.set_selection(BlockSelection::caret(BlockPosition::new(id, 6)))
+            .unwrap();
+        m.insert_line_break().unwrap();
+        assert_eq!(m.source(), "第一\n行\n第二行\n\n");
+    }
+
+    #[test]
+    fn blank_line_still_starts_a_new_block() {
+        let m = model("第一段\n\n第二段");
+        assert_eq!(m.source(), "第一段\n\n第二段");
+        assert_eq!(m.document().leaves().count(), 2);
+    }
+
+    #[test]
+    fn prose_paragraphs_hang_off_the_root_and_list_items_do_not() {
+        let m = model("- 列表项\n\n正文");
+        let kinds: Vec<_> = m
+            .document()
+            .leaves()
+            .map(|b| b.parent().unwrap().kind())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                BlockKind::ListItem { checked: None },
+                BlockKind::Root
+            ]
+        );
+    }
+
+    #[test]
+    fn marks_span_a_line_break() {
+        let m = model("**粗体\n继续粗体**\n");
+        assert_eq!(m.source(), "**粗体\n继续粗体**\n\n");
+    }
+}
