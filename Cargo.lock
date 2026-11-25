@@ -2188,6 +2188,8 @@ dependencies = [
 [[package]]
 name = "gpui-kit-markdown-editor"
 version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27053893224d3388a159ef28795606e01b41e83398c6812a2276cbd0b91fc5b8"
 dependencies = [
  "gpui-kit",
  "markdown",
@@ -3867,6 +3869,7 @@ dependencies = [
  "embed-resource",
  "gpui-kit",
  "gpui-kit-markdown-editor",
+ "ropey",
  "serde_json",
 ]
 
@@ -6273,7 +6276,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

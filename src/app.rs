@@ -288,6 +288,10 @@ struct Doc {
     /// 最近一次载入或保存时的规范 Markdown。所见即所得编辑器会把文档重新
     /// 序列化成自己的规范形式，用它当基线，打开文件才不会被误判成已修改
     baseline: String,
+    /// 代码文件（json / yaml / go / py …）的 tree-sitter 语言名；
+    /// None 表示普通 Markdown 笔记。代码文件没有所见即所得，
+    /// 源码视图按语法高亮，演示视图包成围栏代码块高亮展示
+    code_lang: Option<&'static str>,
     view: ViewMode,
 }
 
@@ -303,6 +307,14 @@ impl Doc {
     /// 与基线比较，忽略结尾空行（所见即所得往返会去掉尾部空行）
     fn is_dirty(&self, cx: &App) -> bool {
         self.text(cx).trim_end() != self.baseline.trim_end()
+    }
+
+    /// 当前文档对应的演示视图源文本
+    fn preview_source_for(&self, text: &str) -> String {
+        match self.code_lang {
+            Some(lang) => code_preview_source(text, lang),
+            None => preview_source(text),
+        }
     }
 }
 
@@ -632,9 +644,11 @@ impl NotesApp {
             colors.button_foreground = rgb(palette.foreground).into();
             // ghost 按钮的 selected 态取 secondary_active，工具栏的字体/字号/背景/宽度按钮全靠它
             colors.secondary_active = rgba(selection).into();
-            // 代码块语法高亮：深色用 Dracula，浅色用官方的浅色变体 Alucard
+            // 代码块语法高亮与家族配色：深色 Dracula，浅色 Alucard
             theme.highlight_theme = crate::syntax::highlight_theme(dark);
         });
+        // 安装代码块高亮与主题家族配色；每次应用主题都换新的高亮函数，旧配色缓存随之失效
+        crate::syntax::install(dark, cx);
         cx.notify();
     }
 
@@ -647,9 +661,20 @@ impl NotesApp {
         }
     }
 
-    fn make_editor(text: &str, window: &mut Window, cx: &mut Context<Self>) -> Entity<EditorState> {
-        let editor = cx
-            .new(|cx| EditorState::new(window, cx).line_number(true).searchable(false));
+    fn make_editor(
+        text: &str,
+        language: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<EditorState> {
+        let editor = cx.new(|cx| {
+            let state = EditorState::new(window, cx).line_number(true).searchable(false);
+            match language {
+                // 代码文件按语言开语法高亮（tree-sitter + 主题高亮配色）
+                Some(lang) => state.language(lang),
+                None => state,
+            }
+        });
         editor.update(cx, |state, cx| state.set_value(text, window, cx));
 
         cx.subscribe(&editor, |_: &mut NotesApp, _, event: &InputEvent, cx| {
@@ -694,13 +719,26 @@ impl NotesApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Doc {
-        let editor = Self::make_editor(text, window, cx);
+        let code_lang = code_language(&path);
+        let editor = Self::make_editor(text, code_lang, window, cx);
         let (wysiwyg, wys_scroll) = Self::make_block_editor(text, window, cx);
-        let preview_src = preview_source(text);
+        let preview_src = match code_lang {
+            Some(lang) => code_preview_source(text, lang),
+            None => preview_source(text),
+        };
         let preview = cx.new(|cx| TextViewState::markdown(&preview_src, cx));
         // 所见即所得重新序列化后会得到规范形式，与原文格式未必一致，
-        // 以它当基线，打开文件不会立刻被当成改动
-        let baseline = wysiwyg.read(cx).source();
+        // 以它当基线，打开文件不会立刻被当成改动；代码文件直接用原文当基线
+        let baseline = match code_lang {
+            Some(_) => text.to_string(),
+            None => wysiwyg.read(cx).source(),
+        };
+        // 代码文件没有所见即所得，直接进源码视图
+        let view = if code_lang.is_some() {
+            ViewMode::Source
+        } else {
+            ViewMode::Edit
+        };
         Doc {
             path,
             untitled,
@@ -710,7 +748,8 @@ impl NotesApp {
             preview,
             preview_src,
             baseline,
-            view: ViewMode::Edit,
+            code_lang,
+            view,
         }
     }
 
@@ -765,6 +804,10 @@ impl NotesApp {
             return;
         };
         if doc.view == view {
+            return;
+        }
+        // 代码文件没有所见即所得视图
+        if doc.code_lang.is_some() && view == ViewMode::Edit {
             return;
         }
 
@@ -1780,7 +1823,7 @@ impl NotesApp {
         }
 
         // 先让演示视图跟上文档的最新文本，否则算出的源区间对不上渲染结果
-        let src = preview_source(&doc.text(cx));
+        let src = doc.preview_source_for(&doc.text(cx));
         if doc.preview_src != src {
             doc.preview_src = src.clone();
             doc.preview.update(cx, |state, cx| state.set_text(&src, cx));
@@ -3717,6 +3760,10 @@ impl NotesApp {
             .and_then(|ix| self.tabs.get(ix))
             .is_some_and(|tab| tab.dirty(cx));
         let is_file = self.active_doc().is_some();
+        // 代码文件（json / yaml / go / py…）没有所见即所得编辑
+        let is_code_doc = self
+            .active_doc()
+            .is_some_and(|doc| doc.code_lang.is_some());
         // 临时文件即使还没改过也能保存（落盘这件事本身就有意义）
         let untitled = self
             .active
@@ -3897,71 +3944,79 @@ impl NotesApp {
             .gap_0p5()
             .items_center()
             .border_b_1()
-            .border_color(border)
-            .child(
-                Button::new("mode-edit")
-                    .ghost()
-                    .small()
-                    .selected(mode == ViewMode::Edit)
-                    .icon(IconName::Pencil)
-                    .tooltip("所见即所得")
-                    .disabled(!is_file)
-                    .on_click({
-                        let view = view.clone();
-                        move |_, window, cx| {
-                            view.update(cx, |this, cx| this.switch_view(ViewMode::Edit, window, cx))
-                        }
-                    }),
-            )
-            .child(
-                Button::new("mode-source")
-                    .ghost()
-                    .small()
-                    .selected(mode == ViewMode::Source)
-                    .icon(IconName::Code)
-                    .tooltip("源码")
-                    .disabled(!is_file)
-                    .on_click({
-                        let view = view.clone();
-                        move |_, window, cx| {
-                            view.update(cx, |this, cx| {
-                                this.switch_view(ViewMode::Source, window, cx)
-                            })
-                        }
-                    }),
-            )
-            .child(
-                Button::new("mode-preview")
-                    .ghost()
-                    .small()
-                    .selected(mode == ViewMode::Preview)
-                    .icon(IconName::Eye)
-                    .tooltip("演示（Ctrl+Shift+V 轮换）")
-                    .disabled(!is_file)
-                    .on_click({
-                        let view = view.clone();
-                        move |_, window, cx| {
-                            view.update(cx, |this, cx| {
-                                this.switch_view(ViewMode::Preview, window, cx)
-                            })
-                        }
-                    }),
-            )
-            .child(
-                Button::new("mode-split")
-                    .ghost()
-                    .small()
-                    .selected(mode == ViewMode::Split)
-                    .icon(IconName::SquareSplitHorizontal)
-                    .tooltip("对照")
-                    .disabled(!is_file)
-                    .on_click({
-                        let view = view.clone();
-                        move |_, window, cx| {
-                            view.update(cx, |this, cx| this.switch_view(ViewMode::Split, window, cx))
-                        }
-                    }),
-            )
+            .border_color(border);
+        // 四个视图按钮只对 Markdown 笔记有意义；代码文件（json / yaml / go…）
+        // 没有所见即所得，整组隐藏
+        let toolbar = if is_file && !is_code_doc {
+            toolbar
+                .child(
+                    Button::new("mode-edit")
+                        .ghost()
+                        .small()
+                        .selected(mode == ViewMode::Edit)
+                        .icon(IconName::Pencil)
+                        .tooltip("所见即所得")
+                        .on_click({
+                            let view = view.clone();
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.switch_view(ViewMode::Edit, window, cx)
+                                })
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("mode-source")
+                        .ghost()
+                        .small()
+                        .selected(mode == ViewMode::Source)
+                        .icon(IconName::Code)
+                        .tooltip("源码")
+                        .on_click({
+                            let view = view.clone();
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.switch_view(ViewMode::Source, window, cx)
+                                })
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("mode-preview")
+                        .ghost()
+                        .small()
+                        .selected(mode == ViewMode::Preview)
+                        .icon(IconName::Eye)
+                        .tooltip("演示（Ctrl+Shift+V 轮换）")
+                        .on_click({
+                            let view = view.clone();
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.switch_view(ViewMode::Preview, window, cx)
+                                })
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("mode-split")
+                        .ghost()
+                        .small()
+                        .selected(mode == ViewMode::Split)
+                        .icon(IconName::SquareSplitHorizontal)
+                        .tooltip("对照")
+                        .on_click({
+                            let view = view.clone();
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.switch_view(ViewMode::Split, window, cx)
+                                })
+                            }
+                        }),
+                )
+        } else {
+            toolbar
+        };
+        let toolbar = toolbar
             .child(div().flex_1())
             .child(
                 Button::new("save-doc")
@@ -3992,7 +4047,7 @@ impl NotesApp {
             && let Some(Tab::File(doc)) = self.tabs.get_mut(ix)
             && matches!(doc.view, ViewMode::Preview | ViewMode::Split)
         {
-            let src = preview_source(&doc.text(cx));
+            let src = doc.preview_source_for(&doc.text(cx));
             if doc.preview_src != src {
                 doc.preview_src = src.clone();
                 doc.preview.update(cx, |state, cx| state.set_text(&src, cx));
@@ -4384,6 +4439,50 @@ fn preview_source(text: &str) -> String {
         out.pop();
     }
     out
+}
+
+/// 按扩展名识别常见代码文件，返回 tree-sitter 语言名（供源码高亮与代码块演示用）
+fn code_language(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "json" | "jsonc" | "json5" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" | "ini" | "conf" => "toml",
+        "go" => "go",
+        "py" | "pyw" => "python",
+        "rs" => "rust",
+        "js" | "mjs" | "cjs" | "jsx" => "javascript",
+        "ts" | "mts" | "cts" => "typescript",
+        "tsx" => "tsx",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" => "cpp",
+        "cs" => "csharp",
+        "java" => "java",
+        "kt" | "kts" => "kotlin",
+        "swift" => "swift",
+        "rb" => "ruby",
+        "php" => "php",
+        "sh" | "bash" | "zsh" => "bash",
+        "sql" => "sql",
+        "lua" => "lua",
+        "html" | "htm" | "xml" | "svg" => "html",
+        "css" => "css",
+        "proto" => "proto",
+        "cmake" => "cmake",
+        "makefile" | "mk" => "make",
+        "diff" | "patch" => "diff",
+        "zig" => "zig",
+        "scala" => "scala",
+        "ex" | "exs" => "elixir",
+        _ => return None,
+    })
+}
+
+/// 代码文件的演示视图：包成围栏代码块，走代码块语法高亮。
+///
+/// 用四个反引号做围栏，这样文件内容里即使有 ``` 也不会破坏结构。
+fn code_preview_source(text: &str, lang: &str) -> String {
+    format!("````{lang}\n{text}\n````\n")
 }
 
 /// 内嵌的阅读字体：编译期直接打包进可执行文件，不依赖外部 ttf

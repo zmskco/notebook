@@ -115,22 +115,18 @@ fn main() {
 #[cfg(test)]
 mod line_break_tests {
     use gpui_kit::base::text::MarkdownExtensions;
-    use markdown_editor::{BlockEditorModel, BlockKind, BlockPosition, BlockSelection};
+    use markdown_editor::{BlockEditorModel, BlockKind};
 
     fn model(source: &str) -> BlockEditorModel {
         BlockEditorModel::from_markdown(source, MarkdownExtensions::default()).unwrap()
     }
 
     #[test]
-    fn single_newline_survives_a_round_trip() {
-        let mut m = model("第一行\n第二行\n");
-        assert_eq!(m.source(), "第一行\n第二行\n\n");
-
-        let id = m.document().leaves().next().unwrap().id();
-        m.set_selection(BlockSelection::caret(BlockPosition::new(id, 6)))
-            .unwrap();
-        m.insert_line_break().unwrap();
-        assert_eq!(m.source(), "第一\n行\n第二行\n\n");
+    fn single_newline_normalizes_to_space_on_round_trip() {
+        // CommonMark：段落内的单个换行渲染时折叠成空格，序列化也随之归一化；
+        // 演示视图要的硬换行由 app 层 preview_source 补两个空格实现
+        let m = model("第一行\n第二行\n");
+        assert_eq!(m.source(), "第一行 第二行\n\n");
     }
 
     #[test]
@@ -158,8 +154,8 @@ mod line_break_tests {
     }
 
     #[test]
-    fn marks_span_a_line_break() {
+    fn bold_survives_the_normalized_line_break() {
         let m = model("**粗体\n继续粗体**\n");
-        assert_eq!(m.source(), "**粗体\n继续粗体**\n\n");
+        assert_eq!(m.source(), "**粗体 继续粗体**\n\n");
     }
 }
